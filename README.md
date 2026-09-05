@@ -2,88 +2,449 @@
 
 **PicoCalc / uConsole UART File Transfer Protocol** — v0.1
 
-PicoCalc has no network. uConsole does. PCUTP lets the uConsole act as a
-network gateway: it downloads a file over HTTP(S), then hands it to the
-PicoCalc over a 115200 8N1 UART link, block by block, with CRC32 on every
-block and on the finished file.
+PCUTPは、**インターネット接続機能を持たないデバイスに、UART経由でネットワーク機能を持たせるための軽量プロトコル**です。
 
+簡単に言うと、
+
+> **UARTを持つオフライン機器と、インターネット接続可能な機器をつなぎ、オフライン機器側からネット上のデータを取得できるようにする仕組みです。**
+
+```text
+Internet
+   │
+   │ HTTP / HTTPS
+   ▼
+uConsole
+   │
+   │ UART / PCUTP
+   ▼
+PicoCalc
+   │
+   ▼
+SDカード
 ```
-Internet --HTTP/HTTPS--> uConsole --UART--> PicoCalc --> SD card
+
+完全なプロトコル仕様は [`docs/PCUTP-0.1.md`](docs/PCUTP-0.1.md) を参照してください。
+
+## このプロジェクトは何ですか？
+
+組み込み機器、マイコン、レトロ風コンピュータ、電卓、専用端末などの中には、Wi-Fi、Ethernet、TCP/IPスタック、HTTPS通信機能を持たないものが多くあります。
+
+しかし、その一方で非常に多くの機器には **UART** が搭載されています。
+
+PCUTPは、そのUARTを利用して、ネットワーク機能を持たないデバイスとインターネット接続可能な機器を接続します。
+
+オフライン側のデバイス自身が、以下を実装する必要はありません。
+
+- TCP/IP
+- DNS
+- HTTP / HTTPS
+- TLS
+- Wi-Fiドライバ
+- Ethernetドライバ
+
+代わりに、UART経由で単純なリクエストを送信します。
+
+ネットワーク側の機器が実際のインターネット通信を担当し、その結果をUART経由で返します。
+
+たとえば、
+
+```text
+PicoCalc
+   │
+   │ GET TEST.BAS https://example.com/test.bas
+   ▼
+uConsole
+   │
+   │ HTTPS
+   ▼
+Internet
 ```
 
-Full protocol: [docs/PCUTP-0.1.md](docs/PCUTP-0.1.md).
+という流れで通信します。
 
-## Layout
+uConsoleがインターネットからファイルを取得し、そのファイルを複数ブロックに分割してUART経由でPicoCalcへ転送します。
 
-| Path | What |
+PicoCalcは受信したデータを検証し、SDカードへ保存します。
+
+つまりuConsoleは、PicoCalcから見ると **現代版のシリアル通信モデム** のような役割を果たします。
+
+## なぜこの仕組みを使うのか？
+
+小さなデバイスにとって、ネットワーク通信は意外と重い処理です。
+
+BASICを動かしたり、画面を表示したり、センサーを制御したり、ファイルを保存したりする能力があっても、現代的なインターネット通信に必要な機能まで実装できるとは限りません。
+
+特にHTTPS通信では、TLS、証明書処理、DNS、TCP/IP、HTTPなど、多くの機能が必要になります。
+
+PCUTPでは、こうした複雑な処理をより高性能な機器側へ任せます。
+
+```text
+小型デバイス側に必要なもの
+
+UART
+ファイルシステム
+CRC32
+簡単なプロトコル解析
+
+        ↓
+
+不要になるもの
+
+Wi-Fiドライバ
+TCP/IPスタック
+DNSリゾルバ
+HTTPクライアント
+TLS実装
+証明書処理
+```
+
+つまり、**小型デバイスを無理にネットワークコンピュータ化しなくても、インターネットを利用できます。**
+
+## どんな用途に使える？
+
+PCUTPはもともと **PicoCalc + uConsole** の組み合わせ向けに作られました。
+
+しかし、考え方自体はこの2台に限定されません。
+
+たとえば、
+
+- マイコン
+- 組み込み機器
+- レトロコンピュータ
+- 電卓
+- 測定機器
+- 開発ボード
+- 産業機器
+- 自作端末
+- UARTはあるがネットワーク機能を持たない機器
+
+などにも応用できます。
+
+片方がUART通信できて、もう片方がインターネット接続できるなら、同じ構成を応用できます。
+
+## PCUTPのファイル転送方式
+
+PCUTPでは、**制御情報はASCIIテキスト、ファイル本体はRAWバイナリ**というハイブリッド方式を採用しています。
+
+たとえば制御メッセージは、
+
+```text
+HELLO PCUTP/1
+GET TEST.BAS https://example.com/test.bas
+META TEST.BAS 18342 1024 18 8B58A921
+DATA 0 1024 4A91F33C
+ACK 0
+```
+
+のようになります。
+
+一方、ファイル本体はそのままバイナリデータとして転送します。
+
+そのため `0x00` / `0x0A` / `0x0D` / `0xFF` のような値を含むPNG、ZIP、BINなどの任意のバイナリファイルも安全に転送できます。
+
+## データの整合性
+
+UARTは非常に単純な通信方式ですが、PCUTPでは転送データが必ず正しいとは仮定しません。
+
+各データブロックにはCRC32を付加します。
+
+```text
+DATA 5 1024 A41B30C9
+<1024 bytes>
+```
+
+受信側でもCRC32を計算します。
+
+一致した場合：
+
+```text
+ACK 5
+```
+
+破損していた場合：
+
+```text
+NAK 5 CRC
+```
+
+送信側は、そのブロックだけを再送します。
+
+さらに転送終了後、ファイル全体についてもCRC32を確認します。
+
+```text
+ブロックごとのCRC32
+        +
+ファイル全体のCRC32
+```
+
+という二段階の整合性確認を行います。
+
+## 安全なファイル保存
+
+転送中のファイルは、最初から完成ファイルとして保存しません。
+
+まず、
+
+```text
+TEST.BAS.PART
+```
+
+として保存します。
+
+すべての転送が完了し、最終CRC32も一致した場合のみ、
+
+```text
+TEST.BAS
+```
+
+へ変更します。
+
+途中で通信が切断された場合やCRCが一致しなかった場合は `.PART` ファイルとして残ります。
+
+これにより、壊れたファイルが正常な完成ファイルとして扱われることを防ぎます。
+
+## 現在のプロトコル
+
+PCUTP v0.1では、現在以下の制御語を使用します。
+
+```text
+HELLO
+GET
+META
+READY
+DATA
+ACK
+NAK
+DONE
+OK
+ERR
+```
+
+標準UART設定：
+
+```text
+115200 baud
+8 data bits
+No parity
+1 stop bit
+No flow control
+```
+
+つまり **115200 8N1** です。
+
+標準ブロックサイズは **1024 bytes** です。
+
+## アーキテクチャ
+
+### uConsole側
+
+uConsoleはネットワークゲートウェイとして動作します。
+
+```text
+UARTコマンド受信
+    ↓
+HTTP / HTTPS通信
+    ↓
+ファイル取得
+    ↓
+ファイル検証
+    ↓
+ブロック分割
+    ↓
+CRC32計算
+    ↓
+UART送信
+```
+
+uConsole側の実装にはPythonを使用しています。
+
+### PicoCalc側
+
+PicoCalcはUARTクライアントとして動作します。
+
+```text
+プロトコル解析
+    ↓
+バイナリデータ受信
+    ↓
+CRC32検証
+    ↓
+ACK / NAK
+    ↓
+SDカードへ保存
+```
+
+PicoCalc側はPicoMite BASICで実装されています。
+
+## リポジトリ構成
+
+| Path | 内容 |
 | --- | --- |
-| `src/pcutp/` | uConsole side: framing, CRC32, HTTP fetch, sender daemon |
-| `src/pcutp/client.py` | Reference receiver in Python (mirrors `PCUTP.BAS`) |
-| `picocalc/PCUTP.BAS` | PicoMite BASIC receiver, single self-contained file (no `#Include` on this platform) |
-| `tests/` | Unit and end-to-end protocol tests over an in-memory UART |
-| `Dockerfile` | The build/test environment, used locally and by CI |
+| `src/pcutp/` | uConsole側：フレーミング、CRC32、HTTP取得、送信デーモン |
+| `src/pcutp/client.py` | Python製の参照受信実装（`PCUTP.BAS` と同じ状態遷移） |
+| `picocalc/PCUTP.BAS` | PicoMite BASIC製のPicoCalc受信実装 |
+| `tests/` | インメモリUARTを使用した単体・E2Eテスト |
+| `Dockerfile` | ローカル・CI共通のビルド／テスト環境 |
+| `docs/PCUTP-0.1.md` | PCUTP v0.1 プロトコル仕様書 |
 
-## Build and test with Docker
+## 実機構成
 
-Everything runs in the container — no local Python setup needed.
+現在の実機構成では、
+
+```text
+PicoCalc Core GPIO
+GP4 / GP5
+     │
+     │ UART 115200 8N1
+     ▼
+uConsole
+```
+
+という接続を使用しています。
+
+テストしたPicoCalcでは、Mainboard GPIOs側にある同名のUART1ピンではなく、Core GPIOs側のGP4 / GP5を使用しています。
+
+### uConsole側で起動
+
+Dockerを使用する場合：
+
+```bash
+docker compose run --rm serve
+```
+
+Dockerを使用しない場合：
+
+```bash
+pip install -e .
+pcutpd serve --port /dev/ttyS0
+```
+
+PicoCalc側：
+
+```text
+> RUN "PCUTP.BAS"
+```
+
+## Dockerでビルド・テスト
+
+ローカルにPython環境を構築しなくても、Dockerだけでビルドとテストを実行できます。
 
 ```bash
 docker compose run --rm build
 ```
 
-That lints, runs the test suite, builds a wheel into `./dist`, and runs a
-hardware-free transfer of 20 000 bytes through the full protocol.
-
-Or by hand:
+個別に実行する場合：
 
 ```bash
 docker build -t pcutp:dev .
 docker run --rm pcutp:dev python -m pytest -q
 ```
 
-## Run against real hardware
+## 実機なしでテスト可能
 
-On the uConsole, with the UART wired to the PicoCalc's "Core GPIOs" header
-(GP4/GP5, common ground) - not the identically-labelled UART1 pins on the
-"Mainboard GPIOs" header, which are dead on at least one unit:
+Python側には、送信側だけでなく受信側のリファレンス実装も用意されています。
 
-```bash
-docker compose run --rm serve
-```
-
-or without Docker:
-
-```bash
-pip install -e . && pcutpd serve --port /dev/ttyS0
-```
-
-Then on the PicoCalc:
-
-```
-> RUN "PCUTP.BAS"
-```
-
-## Self test without hardware
+そのため、実際のPicoCalcやuConsoleを接続しなくてもプロトコル全体をテストできます。
 
 ```bash
 python -m pcutp.daemon selftest --size 65536
 ```
 
-Runs both ends over an in-memory link: HELLO, GET, META, block transfer with
-CRC checks, DONE, and the `.PART` → final rename.
+このセルフテストでは、
 
-## CI
+```text
+HELLO
+GET
+META
+DATA転送
+CRC検証
+ACK / NAK
+DONE
+最終CRC検証
+.PART → 完成ファイル
+```
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) builds the Docker image
-(with GitHub Actions layer caching), then runs ruff, pytest, the protocol self
-test, and the wheel build inside that image, uploading `dist/` as an artifact.
+まで一連の処理を確認します。
 
-## Status
+## テスト内容
 
-v0.1 scope: `HELLO GET META READY DATA ACK NAK DONE OK ERR`, 1024-byte blocks,
-per-block and whole-file CRC32, retransmit, `.PART` staging.
-`RESUME`, `LIST`, `PUSH`, SHA-256, compression and API access are v0.2+.
+現在のテストでは、
+
+- 0バイトファイル
+- 1バイトファイル
+- ブロック境界サイズ
+- 複数ブロック転送
+- 任意のバイナリデータ
+- 転送途中のデータ破損
+- 自動再送
+- ストレージ不足
+- プロトコルバージョン不一致
+- HTTPエラー
+- 最終CRC不一致
+
+などを検証しています。
+
+GitHub ActionsではDockerイメージを構築し、ruff、pytest、プロトコルセルフテスト、wheel/sdistのビルドを実行します。
+
+## 今後の拡張案
+
+将来的には、
+
+```text
+RESUME
+LIST
+PUSH
+SHA-256
+圧縮転送
+高速UART
+APIアクセス
+ファイル一覧
+双方向転送
+```
+
+などを追加できます。
+
+また、単なるファイル転送だけでなく、
+
+```text
+WEATHER Tokyo
+TIME Tokyo
+RSS https://...
+API ...
+```
+
+のようなコマンドを実装することで、**UART接続された汎用インターネットモデム**のような使い方も可能になります。
+
+## PCUTPの考え方
+
+PCUTPの発想は非常に単純です。
+
+> **機器自身がインターネット機能を持っていなくても、別の機器にインターネット通信を代行してもらえばいい。**
+
+UARTは古く、単純で、安価で、非常に多くの機器に搭載されています。
+
+一方、現代のインターネット通信は複雑です。
+
+PCUTPは、その2つの世界をつなぎます。
+
+```text
+古い・単純なデバイス
+        │
+       UART
+        │
+        ▼
+現代的なネットワークゲートウェイ
+        │
+      HTTPS
+        │
+        ▼
+     Internet
+```
+
+オフライン機器にインターネット機能を持たせるために、必ずしも、その機器自身へネットワーク機能を全部実装する必要はありません。
+
+**モデムをつなげばいいのです。**
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — [`LICENSE`](LICENSE) を参照してください。
