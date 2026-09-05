@@ -197,6 +197,12 @@ EndIf
 
 Tone1 HZ_TX_OK, MS_WORD
 Print #1, "OK " + Hex$(running, 8)
+' RENAME will not overwrite, so re-downloading a name that already exists
+' aborted here with "Access denied" and left the .PART behind - after a
+' fully verified transfer. Drop the old copy first; nothing is discarded
+' until the replacement has passed both CRC checks. Note FAT is case
+' insensitive, so TURRICAN.MOD and turrican.mod are the same file.
+If MM.Info(Exists File DEST$ + fn$) Then Kill DEST$ + fn$
 Rename DEST$ + fn$ + ".PART" As DEST$ + fn$
 Print "Transfer complete."
 Print "CRC32: OK"
