@@ -13,7 +13,7 @@ Const VER$      = "PCUTP/1"
 Const BLKMAX    = 1024
 Const ACKTMO    = 5000        ' ms, section 16
 Const DATTMO    = 10000       ' ms, raw payload after a DATA header
-Const DEST$     = "A:/"       ' SD card destination directory
+Const DEST$     = "B:/"       ' SD card destination directory (PicoMite: B: = SD)
 
 Dim s$, fn$, url$, meta$(5)
 Dim size, blksz, blocks, seq, ln, want$, got$

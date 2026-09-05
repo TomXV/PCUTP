@@ -3,7 +3,7 @@
 `PCUTP.BAS` is the PicoMite BASIC receiver (main state machine).
 Helper routines (`RecvLine$`, `RecvRaw`, `Crc32`, `Split`) live in `PCUTPLIB.BAS`.
 
-Copy both to the SD card and run:
+Copy both to the SD card (B:/) and run:
 
 ```
 > RUN "PCUTP.BAS"
