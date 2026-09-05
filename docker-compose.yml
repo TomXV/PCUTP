@@ -1,0 +1,19 @@
+services:
+  build:
+    build: .
+    image: pcutp:dev
+    command: >
+      sh -c "ruff check src tests &&
+             python -m pytest &&
+             python -m build --wheel --outdir /app/dist &&
+             python -m pcutp.daemon selftest --size 20000"
+    volumes:
+      - ./dist:/app/dist
+
+  # Attach the real UART: docker compose run --rm serve
+  serve:
+    build: .
+    image: pcutp:dev
+    command: ["pcutpd", "serve", "--port", "/dev/ttyS0"]
+    devices:
+      - "/dev/ttyS0:/dev/ttyS0"

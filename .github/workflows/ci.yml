@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  docker-build:
+    name: Build & test in Docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: pcutp:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Lint (ruff)
+        run: docker run --rm pcutp:ci ruff check src tests
+
+      - name: Unit & protocol tests
+        run: docker run --rm pcutp:ci python -m pytest -q
+
+      - name: Protocol self test (no hardware)
+        run: docker run --rm pcutp:ci python -m pcutp.daemon selftest --size 65536
+
+      - name: Build wheel
+        run: |
+          mkdir -p dist
+          docker run --rm -v "$PWD/dist:/out" pcutp:ci \
+            python -m build --wheel --sdist --outdir /out
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: pcutp-dist
+          path: dist/*
