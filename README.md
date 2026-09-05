@@ -442,17 +442,30 @@ Dockerを使用する場合：
 docker compose run --rm serve
 ```
 
-Dockerを使用しない場合：
+Dockerを使用しない場合（このリポジトリの中で）：
 
 ```bash
-pip install -e .
-pcutpd serve --port /dev/ttyS0
+PYTHONPATH=src python3 -m pcutp.daemon serve
 ```
 
-PicoCalc側：
+接続されているUSBシリアル変換器が1つだけなら `--port` は不要です（自動で選ばれます）。複数ある場合は候補が表示されるので、`--port` で指定してください。
+
+```bash
+PYTHONPATH=src python3 -m pcutp.daemon ports    # 候補を一覧表示
+```
+
+音と制御行の両方を出す場合：
+
+```bash
+PYTHONPATH=src python3 -u -m pcutp.daemon serve --trace --sound
+```
+
+`--trace` `--quiet` `--block` はサブコマンドの前後どちらに書いても構いません。音の一覧は `pcutp.daemon sounds` で名前付きで再生できます。
+
+PicoCalc側（ランチャーがカレントを `B:/pico1-apps` にするため、フルパスで指定します）：
 
 ```text
-> RUN "PCUTP.BAS"
+> RUN "B:/PCUTP.BAS"
 ```
 
 ## Dockerでビルド・テスト

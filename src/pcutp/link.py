@@ -5,6 +5,7 @@ count, never by delimiter, so binary data containing 0x0A is safe.
 """
 
 import time
+from collections.abc import Callable
 
 from .const import LF
 from .errors import ProtocolError, TimeoutError_
@@ -16,17 +17,22 @@ MAX_LINE_LEN = 512
 
 class Link:
     def __init__(
-        self, transport: Transport, trace: bool = False, sound: "Sound | None" = None
+        self,
+        transport: Transport,
+        trace: bool = False,
+        sound: "Sound | None" = None,
+        log: "Callable[[str], None]" = print,
     ):
         self.t = transport
         self.trace = trace
+        self.log = log
         self.sound = sound or Sound(enabled=False)
         self._buf = bytearray()
 
     # -- sending ---------------------------------------------------------
     def send_line(self, line: str) -> None:
         if self.trace:
-            print(f"TX> {line}")
+            self.log(f"TX> {line}")
         self.sound.line(line)
         self.t.write(line.encode("ascii") + LF)
 
@@ -39,7 +45,7 @@ class Link:
         own flush/round-trip cost, and a DATA line is always followed by
         its block, so there's no reason to pay that twice per block."""
         if self.trace:
-            print(f"TX> {line}")
+            self.log(f"TX> {line}")
         self.sound.line(line)
         self.t.write(line.encode("ascii") + LF + data)
 
@@ -55,7 +61,7 @@ class Link:
                 del self._buf[: idx + 1]
                 text = line.decode("ascii", errors="replace").strip("\r")
                 if self.trace:
-                    print(f"RX< {text}")
+                    self.log(f"RX< {text}")
                 self.sound.line(text)
                 return text
             if len(self._buf) > MAX_LINE_LEN:

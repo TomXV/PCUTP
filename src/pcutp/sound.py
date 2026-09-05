@@ -172,6 +172,10 @@ class Sound:
             self._push(self._net["carrier"])
         self._push(self._net["hangup"])
 
+    def effect(self, name: str) -> None:
+        """Play one internet-leg effect by name. For `pcutpd sounds`."""
+        self._push(self._net.get(name))
+
     def net_error(self, exc: BaseException) -> None:
         """Falling sweep, pitched by what went wrong out there."""
         if not self.enabled or self._net is None:
