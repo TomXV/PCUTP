@@ -13,7 +13,7 @@ launcher leaves the working directory at `B:/pico1-apps`, not `B:/`:
 ```
 
 Wiring: PicoCalc's "Core GPIOs" header, GP4 (TX) / GP5 (RX), to the
-uConsole UART, common ground, 115200 8N1. Use *Core GPIOs*, not the
+uConsole UART, common ground, 460800 8N1. Use *Core GPIOs*, not the
 identically-labelled UART1_RX/UART1_TX pins on the "Mainboard GPIOs"
 header - those tested dead on this unit even with a direct on-board
 loopback (no external wiring), and are suspected to be routed to the

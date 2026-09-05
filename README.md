@@ -261,8 +261,8 @@ PCUTPでは、**制御情報はASCIIテキスト、ファイル本体はRAWバ�
 ```text
 HELLO PCUTP/1
 GET TEST.BAS https://example.com/test.bas
-META TEST.BAS 18342 1024 18 8B58A921
-DATA 0 1024 4A91F33C
+META TEST.BAS 18342 4096 5 8B58A921
+DATA 0 4096 4A91F33C
 ACK 0
 ```
 
@@ -279,8 +279,8 @@ UARTは非常に単純な通信方式ですが、PCUTPでは転送データが�
 各データブロックにはCRC32を付加します。
 
 ```text
-DATA 5 1024 A41B30C9
-<1024 bytes>
+DATA 5 4096 A41B30C9
+<4096 bytes>
 ```
 
 受信側でもCRC32を計算します。
@@ -353,16 +353,16 @@ ERR
 標準UART設定：
 
 ```text
-115200 baud
+460800 baud
 8 data bits
 No parity
 1 stop bit
 No flow control
 ```
 
-つまり **115200 8N1** です。
+つまり **460800 8N1** です。
 
-標準ブロックサイズは **1024 bytes** です。
+標準ブロックサイズは **4096 bytes** です。
 
 ## アーキテクチャ
 
@@ -425,7 +425,7 @@ PicoCalc側はPicoMite BASICで実装されています。
 PicoCalc Core GPIO
 GP4 / GP5
      │
-     │ UART 115200 8N1
+     │ UART 460800 8N1
      ▼
 uConsole
 ```

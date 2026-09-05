@@ -28,6 +28,15 @@ class Link:
     def send_raw(self, data: bytes) -> None:
         self.t.write(data)
 
+    def send_line_and_raw(self, line: str, data: bytes) -> None:
+        """Send a control line immediately followed by its raw payload as one
+        write, instead of two - each write on a real serial port pays its
+        own flush/round-trip cost, and a DATA line is always followed by
+        its block, so there's no reason to pay that twice per block."""
+        if self.trace:
+            print(f"TX> {line}")
+        self.t.write(line.encode("ascii") + LF + data)
+
     # -- receiving -------------------------------------------------------
     def recv_line(self, timeout: float) -> str:
         deadline = time.monotonic() + timeout

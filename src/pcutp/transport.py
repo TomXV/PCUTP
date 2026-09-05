@@ -25,7 +25,13 @@ class SerialTransport:
         self._ser = serial.Serial(port=port, baudrate=baudrate, timeout=timeout)
 
     def read(self, size: int) -> bytes:
-        return self._ser.read(size)
+        # pyserial's read(n) waits up to the port timeout trying to fill all
+        # n bytes, even when fewer are actually coming (a short ACK/NAK
+        # line, say). Draining only what's already buffered - falling back
+        # to a bounded 1-byte read when nothing has arrived yet - avoids
+        # paying that timeout on every control-line read.
+        waiting = self._ser.in_waiting
+        return self._ser.read(min(waiting, size) if waiting else 1)
 
     def write(self, data: bytes) -> int:
         n = self._ser.write(data)

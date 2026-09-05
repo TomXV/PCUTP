@@ -120,8 +120,7 @@ class PcutpServer:
         """Send one block until ACKed. Returns how many retransmits it took."""
         timeouts = 0
         for attempt in range(self.max_retries + 1):
-            self.link.send_line(f"DATA {seq} {len(chunk)} {crc32_hex(chunk)}")
-            self.link.send_raw(chunk)
+            self.link.send_line_and_raw(f"DATA {seq} {len(chunk)} {crc32_hex(chunk)}", chunk)
             try:
                 reply = self.link.recv_line(self.ack_timeout)
             except TimeoutError_ as exc:

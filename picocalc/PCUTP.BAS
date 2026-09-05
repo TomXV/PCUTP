@@ -15,7 +15,7 @@ Option Explicit
 Option Default Integer
 
 Const VER$      = "PCUTP/1"
-Const BLKMAX    = 1024
+Const BLKMAX    = 4096
 Const ACKTMO    = 5000        ' ms, section 16
 Const DATTMO    = 10000       ' ms, raw payload after a DATA header
 Const DEST$     = "B:/"       ' SD card destination directory (PicoMite: B: = SD)
@@ -25,12 +25,14 @@ Const DEST$     = "B:/"       ' SD card destination directory (PicoMite: B: = SD
 Drive "B:"
 
 Dim buf%(BLKMAX \ 8)          ' 8 bytes per 64-bit element
-Dim crctab%(255)
-Dim crcready = 0
+Dim rtab%(255)                ' byte-reflect table, for chaining MATH(CRC32 ...)
 
-Dim s$, fn$, url$, meta$(5)
+Dim s$, fn$, url$, meta$(5), ws$
 Dim size, blksz, blocks, seq, ln, want$, got$
-Dim fcrc, running, i, n, retries
+Dim fcrc, running, i, n, retries, wpos, wchunk
+Dim crcBlockOut, crcRunningOut
+
+BuildReflect                  ' must run after rtab%() is dimensioned
 
 ' ---- UART ------------------------------------------------------------
 ' COM2 (UART1) on the Core GPIOs header's GP4 (TX) / GP5 (RX) pins.
@@ -43,7 +45,7 @@ Dim fcrc, running, i, n, retries
 ' dongle). Separate from the console's COM1 (GP0/GP1), so both ports can
 ' be open at once and OPTION SERIAL CONSOLE never needs touching.
 SetPin GP5, GP4, COM2
-Open "COM2:115200" As #1
+Open "COM2:460800" As #1
 
 Print "PCUTP 0.1"
 Print "Connecting...";
@@ -104,17 +106,34 @@ Do While seq < blocks
 
   If ln > blksz Then Print #1, "NAK " + Str$(seq) + " SIZE": Continue Do
 
+  ' CrcBoth runs after the block is fully buffered: doing the native CRC
+  ' per-chunk during reception (the first attempt) cost ~2x the line rate
+  ' at 460800 baud and overran the UART FIFO, silently corrupting bytes.
   If Not RecvRaw(ln, DATTMO) Then
     Print #1, "ERR TIMEOUT": Close #2: Print "timeout": End
   EndIf
 
+  ' Block CRC (fresh) and running whole-file CRC, both native MATH(CRC32 ...).
+  CrcBoth 0, running, ln
+
   If n <> seq Then Print #1, "NAK " + Str$(seq) + " SEQ": Continue Do
 
-  got$ = Hex$(Crc32(0, ln), 8)
+  got$ = Hex$(crcBlockOut, 8)
   If got$ <> want$ Then Print #1, "NAK " + Str$(seq) + " CRC": Continue Do
 
-  For i = 1 To ln : Print #2, Chr$(Peek(Var buf%(0), i - 1)); : Next i
-  running = Crc32Cont(running, ln)
+  ' Write in <=255-byte chunks (MMBasic string cap) instead of one Print
+  ' per byte - the per-byte Peek/Chr$/Print loop was the real bottleneck,
+  ' not the UART link.
+  wpos = 0
+  Do While wpos < ln
+    wchunk = ln - wpos
+    If wchunk > 255 Then wchunk = 255
+    ws$ = String$(wchunk, 32)
+    Memory Copy Peek(VarAddr buf%(0)) + wpos, Peek(VarAddr ws$) + 1, wchunk
+    Print #2, ws$;
+    wpos = wpos + wchunk
+  Loop
+  running = crcRunningOut
   seq = seq + 1
   Print #1, "ACK " + Str$(n)
   Print Chr$(13) + Str$(seq * blksz) + " / " + Str$(size) + " bytes";
@@ -145,39 +164,42 @@ End
 ' ---- helpers ---------------------------------------------------------
 ' RecvLine$  : read one LF-terminated control line, or "" on timeout
 ' RecvRaw    : read exactly `count` bytes into buf%() - never delimiter based
-' Crc32      : CRC-32/ISO-HDLC (poly 0x EDB88320 reflected) over buf%()
-' Crc32Cont  : same, continuing from a running value (whole-file CRC)
+' CrcBoth    : block + running CRC over buf%() using native MATH(CRC32 ...)
+' CrcChunk   : CRC-32/ISO-HDLC of one <=255-byte string, continuing a running
+'              value (see the note below on chaining MATH(CRC32 ...))
 ' Split      : split a control line on spaces into meta$()
 
-' Build the reflected CRC-32/ISO-HDLC table (poly 0xEDB88320) once.
-Sub CrcInit
-  Local i, j, c
+' CRC32 is done by the firmware's MATH(CRC32 ...) over <=255-byte strings,
+' not by a per-byte loop in BASIC. On this hardware that is ~13 us/byte
+' against ~133 us/byte for a table loop, and the CRC loop was over 80% of
+' the transfer time (measured).
+'
+' MATH(CRC32 ...) only takes a string (255 bytes max) or an array of
+' one-byte-per-element values, so a block is CRCed a chunk at a time.
+' Chaining works by feeding the previous result back as `startmask`, undoing
+' the final XOR and the output reflection first - i.e.
+' startmask = Reflect32(previous Xor &HFFFFFFFF). With `state` starting at 0
+' that keeps `state` equal to the standard CRC32 of everything so far, the
+' same contract the old Crc32Cont(seed, count) had.
+Function CrcChunk(state, chunk$)
+  CrcChunk = MATH(CRC32 chunk$, Len(chunk$), &H04C11DB7, Reflect32(state Xor &HFFFFFFFF), &HFFFFFFFF, 1, 1)
+End Function
+
+' Bit-reverse a 32-bit value, byte at a time off rtab%().
+Function Reflect32(v)
+  Reflect32 = (rtab%(v And 255) << 24) Or (rtab%((v >> 8) And 255) << 16) Or (rtab%((v >> 16) And 255) << 8) Or rtab%((v >> 24) And 255)
+End Function
+
+Sub BuildReflect
+  Local i, j, v, r
   For i = 0 To 255
-    c = i
+    v = i : r = 0
     For j = 0 To 7
-      If (c And 1) Then c = (c >> 1) Xor &HEDB88320 Else c = c >> 1
+      If (v >> j) And 1 Then r = r Or (1 << (7 - j))
     Next j
-    crctab%(i) = c And &HFFFFFFFF
+    rtab%(i) = r
   Next i
-  crcready = 1
 End Sub
-
-' CRC of the first `count` bytes of buf%(), continuing from `seed`
-' (pass 0 for a fresh block CRC).
-Function Crc32Cont(seed, count)
-  Local i, c
-  If crcready = 0 Then CrcInit
-  c = (seed Xor &HFFFFFFFF) And &HFFFFFFFF
-  For i = 0 To count - 1
-    c = crctab%((c Xor Peek(Var buf%(0), i)) And &HFF) Xor (c >> 8)
-    c = c And &HFFFFFFFF
-  Next i
-  Crc32Cont = (c Xor &HFFFFFFFF) And &HFFFFFFFF
-End Function
-
-Function Crc32(seed, count)
-  Crc32 = Crc32Cont(seed, count)
-End Function
 
 ' Read one LF-terminated control line. Returns "" on timeout.
 Function RecvLine$(tmo)
@@ -197,6 +219,8 @@ End Function
 
 ' Read exactly `count` raw bytes into buf%(). Returns 1 on success, 0 on timeout.
 ' Byte counted, never delimiter based, so 0x0A/0x0D/0x00/0xFF are safe.
+' Reception only: no CRC here. The block/running CRC is computed afterwards
+' by CrcBoth, so the receive loop only has to keep ahead of the line rate.
 Function RecvRaw(count, tmo)
   Local got = 0, t, n, s$
   t = Timer
@@ -206,14 +230,37 @@ Function RecvRaw(count, tmo)
       If n > count - got Then n = count - got
       If n > 255 Then n = 255  ' Input$ reads into a string, capped at 255 chars
       s$ = Input$(n, #1)
-      Memory Copy Peek(VarAddr s$) + 1, Peek(VarAddr buf%(0)) + got, n
-      got = got + n
-      t = Timer
+      n = Len(s$)              ' INPUT$ may return fewer than asked for
+      If n > 0 Then
+        Memory Copy Peek(VarAddr s$) + 1, Peek(VarAddr buf%(0)) + got, n
+        got = got + n
+        t = Timer
+      EndIf
     EndIf
     If Timer - t > tmo Then RecvRaw = 0 : Exit Function
   Loop
   RecvRaw = 1
 End Function
+
+' Compute the block CRC (seed blockSeed) and the running whole-file CRC
+' (seed fileSeed) over buf%()[0..count) with the firmware's MATH(CRC32 ...),
+' walking the bytes once. Results land in crcBlockOut / crcRunningOut.
+' Called after RecvRaw has buffered the whole block, so its cost never
+' competes with the incoming byte stream.
+Sub CrcBoth(blockSeed, fileSeed, count)
+  Local off = 0, cl, s$
+  crcBlockOut = blockSeed
+  crcRunningOut = fileSeed
+  Do While off < count
+    cl = count - off
+    If cl > 255 Then cl = 255
+    s$ = String$(cl, 32)
+    Memory Copy Peek(VarAddr buf%(0)) + off, Peek(VarAddr s$) + 1, cl
+    crcBlockOut = CrcChunk(crcBlockOut, s$)
+    crcRunningOut = CrcChunk(crcRunningOut, s$)
+    off = off + cl
+  Loop
+End Sub
 
 ' Split a control line on single spaces into parts$().
 Sub Split(line$, parts$())
