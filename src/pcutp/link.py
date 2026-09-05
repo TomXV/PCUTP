@@ -34,7 +34,9 @@ class Link:
         while True:
             idx = self._buf.find(LF)
             if idx >= 0:
-                line = bytes(self._buf[:idx])
+                # Some UARTs (e.g. right after the PicoCalc opens COM2) emit
+                # a couple of stray NUL bytes before the first real line.
+                line = bytes(self._buf[:idx]).lstrip(b"\x00")
                 del self._buf[: idx + 1]
                 text = line.decode("ascii", errors="replace").strip("\r")
                 if self.trace:

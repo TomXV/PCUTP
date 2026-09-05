@@ -19,7 +19,7 @@ Full protocol: [docs/PCUTP-0.1.md](docs/PCUTP-0.1.md).
 | --- | --- |
 | `src/pcutp/` | uConsole side: framing, CRC32, HTTP fetch, sender daemon |
 | `src/pcutp/client.py` | Reference receiver in Python (mirrors `PCUTP.BAS`) |
-| `picocalc/PCUTP.BAS` | PicoMite BASIC receiver + `PCUTPLIB.BAS` helpers |
+| `picocalc/PCUTP.BAS` | PicoMite BASIC receiver, single self-contained file (no `#Include` on this platform) |
 | `tests/` | Unit and end-to-end protocol tests over an in-memory UART |
 | `Dockerfile` | The build/test environment, used locally and by CI |
 
@@ -43,7 +43,9 @@ docker run --rm pcutp:dev python -m pytest -q
 
 ## Run against real hardware
 
-On the uConsole, with the UART wired to the PicoCalc (GP0/GP1, common ground):
+On the uConsole, with the UART wired to the PicoCalc's "Core GPIOs" header
+(GP4/GP5, common ground) - not the identically-labelled UART1 pins on the
+"Mainboard GPIOs" header, which are dead on at least one unit:
 
 ```bash
 docker compose run --rm serve
