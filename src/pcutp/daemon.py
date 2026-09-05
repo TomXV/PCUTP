@@ -12,6 +12,7 @@ from .errors import PcutpError
 from .fetcher import Fetched
 from .link import Link
 from .server import PcutpServer
+from .sound import Sound
 from .transport import PipePair, SerialTransport
 
 
@@ -24,7 +25,8 @@ def _progress(done: int, total: int) -> None:
 
 def run_serial(args: argparse.Namespace) -> int:
     transport = SerialTransport(args.port, args.baud)
-    link = Link(transport, trace=args.trace)
+    sound = Sound(enabled=args.sound)
+    link = Link(transport, trace=args.trace, sound=sound)
     server = PcutpServer(
         link,
         block_size=args.block,
@@ -51,6 +53,7 @@ def run_serial(args: argparse.Namespace) -> int:
         print("\nstopped")
         return 0
     finally:
+        sound.close()
         transport.close()
 
 
@@ -96,6 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--baud", type=int, default=const.DEFAULT_BAUDRATE)
     serve.add_argument("--max-size", type=int, default=const.MAX_FILE_SIZE)
     serve.add_argument("--idle-timeout", type=float, default=3600.0)
+    serve.add_argument(
+        "--sound",
+        action="store_true",
+        help="voice each control word through aplay (an octave below the PicoCalc)",
+    )
     serve.set_defaults(func=run_serial)
 
     test = sub.add_parser("selftest", help="run both ends over an in-memory link")

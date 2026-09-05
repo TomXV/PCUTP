@@ -8,21 +8,26 @@ import time
 
 from .const import LF
 from .errors import ProtocolError, TimeoutError_
+from .sound import Sound
 from .transport import Transport
 
 MAX_LINE_LEN = 512
 
 
 class Link:
-    def __init__(self, transport: Transport, trace: bool = False):
+    def __init__(
+        self, transport: Transport, trace: bool = False, sound: "Sound | None" = None
+    ):
         self.t = transport
         self.trace = trace
+        self.sound = sound or Sound(enabled=False)
         self._buf = bytearray()
 
     # -- sending ---------------------------------------------------------
     def send_line(self, line: str) -> None:
         if self.trace:
             print(f"TX> {line}")
+        self.sound.line(line)
         self.t.write(line.encode("ascii") + LF)
 
     def send_raw(self, data: bytes) -> None:
@@ -35,6 +40,7 @@ class Link:
         its block, so there's no reason to pay that twice per block."""
         if self.trace:
             print(f"TX> {line}")
+        self.sound.line(line)
         self.t.write(line.encode("ascii") + LF + data)
 
     # -- receiving -------------------------------------------------------
@@ -50,6 +56,7 @@ class Link:
                 text = line.decode("ascii", errors="replace").strip("\r")
                 if self.trace:
                     print(f"RX< {text}")
+                self.sound.line(text)
                 return text
             if len(self._buf) > MAX_LINE_LEN:
                 raise ProtocolError("control line too long")

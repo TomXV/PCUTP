@@ -19,6 +19,34 @@ Const BLKMAX    = 4096
 Const ACKTMO    = 5000        ' ms, section 16
 Const DATTMO    = 10000       ' ms, raw payload after a DATA header
 Const DEST$     = "B:/"       ' SD card destination directory (PicoMite: B: = SD)
+Const BEEP      = 1           ' 0 for a silent transfer
+
+' ---- audible protocol feedback ---------------------------------------
+' Every control word has its own pitch, so the exchange can be followed by
+' ear: words arriving from the uConsole sit an octave below the ones the
+' PicoCalc sends, which turns a transfer into an audible call-and-response
+' (DATA down, ACK up, 191 times). Pitches are a pentatonic run so a long
+' burst of them stays listenable; errors drop well below both octaves.
+'
+' PLAY TONE returns immediately - the tone runs in the background - so a
+' blip costs the receive loop one statement. Only the closing flourishes
+' PAUSE between notes, and they only ever run when nothing is in flight.
+Const HZ_RX_HELLO = 523       ' <- HELLO ... OK
+Const HZ_RX_META  = 587       ' <- META
+Const HZ_RX_DATA  = 659       ' <- DATA (once per block)
+Const HZ_RX_DONE  = 784       ' <- DONE
+Const HZ_RX_ERR   = 175       ' <- ERR
+
+Const HZ_TX_HELLO = 1047      ' -> HELLO
+Const HZ_TX_GET   = 1175      ' -> GET
+Const HZ_TX_READY = 1319      ' -> READY
+Const HZ_TX_ACK   = 1568      ' -> ACK (once per block)
+Const HZ_TX_NAK   = 294       ' -> NAK
+Const HZ_TX_OK    = 1760      ' -> OK
+Const HZ_TX_FAIL  = 220       ' -> FAIL / ERR
+
+Const MS_WORD     = 45        ' a spoken control word
+Const MS_BLIP     = 12        ' the per-block pair, kept short
 
 ' RENAME refuses a path on a drive other than the current one, even when
 ' fully qualified with "B:/", so make B: the active drive up front.
@@ -29,7 +57,7 @@ Dim rtab%(255)                ' byte-reflect table, for chaining MATH(CRC32 ...)
 
 Dim s$, fn$, url$, meta$(5), ws$
 Dim size, blksz, blocks, seq, ln, want$, got$
-Dim fcrc, running, i, n, retries, wpos, wchunk
+Dim fcrc, running, i, n, retries, wpos, wchunk, rcvd
 Dim crcBlockOut, crcRunningOut
 
 BuildReflect                  ' must run after rtab%() is dimensioned
@@ -50,11 +78,13 @@ Open "COM2:460800" As #1
 Print "PCUTP 0.1"
 Print "Connecting...";
 
+Tone1 HZ_TX_HELLO, MS_WORD
 Print #1, "HELLO " + VER$
 s$ = RecvLine$(ACKTMO)
-If Left$(s$, 5) = "ERR V" Then Print " version mismatch": End
-If Left$(s$, 16) <> "HELLO " + VER$ + " OK" Then Print " protocol error": End
+If Left$(s$, 5) = "ERR V" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print " version mismatch": End
+If Left$(s$, 16) <> "HELLO " + VER$ + " OK" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print " protocol error": End
 Print " OK"
+Tone1 HZ_RX_HELLO, MS_WORD
 
 ' INPUT during a running program has no arrow-key line editing (unlike the
 ' command prompt): the display can show the cursor moving back over typed
@@ -74,52 +104,57 @@ Do
   If Not ValidName(fn$) Then Print "Invalid filename - retype without using arrow keys."
 Loop Until ValidName(fn$)
 
+Tone1 HZ_TX_GET, MS_WORD
 Print #1, "GET " + fn$ + " " + url$
 
 ' ---- META ------------------------------------------------------------
 s$ = RecvLine$(60000)
-If Left$(s$, 3) = "ERR" Then Print s$: End
+If Left$(s$, 3) = "ERR" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print s$: End
 Split s$, meta$()                       ' META name size blksz blocks crc
-If meta$(0) <> "META" Then Print "protocol error": End
+If meta$(0) <> "META" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print "protocol error": End
+Tone1 HZ_RX_META, MS_WORD
 size   = Val(meta$(2))
 blksz  = Val(meta$(3))
 blocks = Val(meta$(4))
 fcrc   = HexVal(meta$(5))
 
-If blksz > BLKMAX Then Print #1, "ERR PROTOCOL": End
+If blksz > BLKMAX Then Tone1 HZ_TX_FAIL, MS_WORD: Print #1, "ERR PROTOCOL": End
 
 Open DEST$ + fn$ + ".PART" For Output As #2
-Print #1, "READY"
 Print "Downloading..."
+Tone1 HZ_TX_READY, MS_WORD
+Print #1, "READY"
 
 ' ---- data blocks -----------------------------------------------------
 running = 0
 seq = 0
+rcvd = 0
 Do While seq < blocks
   s$ = RecvLine$(2 * ACKTMO)
-  If Left$(s$, 3) = "ERR" Then Close #2: Print s$: End
+  If Left$(s$, 3) = "ERR" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Close #2: Print s$: End
   Split s$, meta$()                     ' DATA seq len crc
-  If meta$(0) <> "DATA" Then Close #2: Print "protocol error": End
+  If meta$(0) <> "DATA" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Close #2: Print "protocol error": End
+  Tone1 HZ_RX_DATA, MS_BLIP
   n     = Val(meta$(1))
   ln    = Val(meta$(2))
   want$ = UCase$(meta$(3))
 
-  If ln > blksz Then Print #1, "NAK " + Str$(seq) + " SIZE": Continue Do
+  If ln > blksz Then Tone1 HZ_TX_NAK, MS_WORD: Print #1, "NAK " + Str$(seq) + " SIZE": Continue Do
 
   ' CrcBoth runs after the block is fully buffered: doing the native CRC
   ' per-chunk during reception (the first attempt) cost ~2x the line rate
   ' at 460800 baud and overran the UART FIFO, silently corrupting bytes.
   If Not RecvRaw(ln, DATTMO) Then
-    Print #1, "ERR TIMEOUT": Close #2: Print "timeout": End
+    Tone1 HZ_TX_FAIL, MS_WORD: SndFail: Print #1, "ERR TIMEOUT": Close #2: Print "timeout": End
   EndIf
 
   ' Block CRC (fresh) and running whole-file CRC, both native MATH(CRC32 ...).
   CrcBoth 0, running, ln
 
-  If n <> seq Then Print #1, "NAK " + Str$(seq) + " SEQ": Continue Do
+  If n <> seq Then Tone1 HZ_TX_NAK, MS_WORD: Print #1, "NAK " + Str$(seq) + " SEQ": Continue Do
 
   got$ = Hex$(crcBlockOut, 8)
-  If got$ <> want$ Then Print #1, "NAK " + Str$(seq) + " CRC": Continue Do
+  If got$ <> want$ Then Tone1 HZ_TX_NAK, MS_WORD: Print #1, "NAK " + Str$(seq) + " CRC": Continue Do
 
   ' Write in <=255-byte chunks (MMBasic string cap) instead of one Print
   ' per byte - the per-byte Peek/Chr$/Print loop was the real bottleneck,
@@ -135,8 +170,12 @@ Do While seq < blocks
   Loop
   running = crcRunningOut
   seq = seq + 1
+  ' Count the bytes actually taken, not seq*blksz - the last block is short,
+  ' which made the counter overshoot the file size.
+  rcvd = rcvd + ln
   Print #1, "ACK " + Str$(n)
-  Print Chr$(13) + Str$(seq * blksz) + " / " + Str$(size) + " bytes";
+  Tone1 HZ_TX_ACK, MS_BLIP
+  Print Chr$(13) + Str$(rcvd) + " / " + Str$(size) + " bytes";
 Loop
 Print
 
@@ -144,19 +183,24 @@ Print
 Close #2
 s$ = RecvLine$(ACKTMO)
 Split s$, meta$()
-If meta$(0) <> "DONE" Then Print "protocol error": End
+If meta$(0) <> "DONE" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print "protocol error": End
+Tone1 HZ_RX_DONE, MS_WORD
 
 If running <> fcrc Or running <> HexVal(meta$(1)) Then
+  Tone1 HZ_TX_FAIL, MS_WORD
+  SndFail
   Print #1, "FAIL FILECRC " + Hex$(running, 8)
   Print "Transfer failed. CRC32 mismatch."
   Print "Kept: " + fn$ + ".PART"
   End
 EndIf
 
+Tone1 HZ_TX_OK, MS_WORD
 Print #1, "OK " + Hex$(running, 8)
 Rename DEST$ + fn$ + ".PART" As DEST$ + fn$
 Print "Transfer complete."
 Print "CRC32: OK"
+SndDone
 Print "Saved:"
 Print fn$
 End
@@ -260,6 +304,34 @@ Sub CrcBoth(blockSeed, fileSeed, count)
     crcRunningOut = CrcChunk(crcRunningOut, s$)
     off = off + cl
   Loop
+End Sub
+
+Sub Tone1(hz, ms)
+  If BEEP Then Play Tone hz, hz, ms
+End Sub
+
+' Both flourishes have to outlive the statements that follow them: a tone is
+' cut off when the program terminates, and every caller here is a few
+' statements from End, which is why the finish used to sound clipped. The
+' trailing PAUSE holds the program open until the last note has rung out.
+Sub SndDone                   ' verified: a held major arpeggio, C-E-G-C
+  Pause 80
+  Tone1 1047, 220
+  Pause 240
+  Tone1 1319, 220
+  Pause 240
+  Tone1 1568, 220
+  Pause 240
+  Tone1 2093, 1000
+  Pause 1050
+End Sub
+
+Sub SndFail                   ' gave up: falling pair under both octaves
+  Pause 60
+  Tone1 330, 220
+  Pause 240
+  Tone1 165, 700
+  Pause 750
 End Sub
 
 ' Split a control line on single spaces into parts$().

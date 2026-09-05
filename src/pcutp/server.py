@@ -77,10 +77,16 @@ class PcutpServer:
             return None
         try:
             filename = sanitize_filename(parts[1])
+            # The one point where this side actually talks to the internet;
+            # sounding it here keeps the HTTP leg audible without threading a
+            # callback through the fetcher.
+            self.link.sound.net_request()
             fetched = self.fetcher(parts[2], max_size=self.max_file_size)
         except PcutpError as exc:
+            self.link.sound.net_error(exc)
             self._fail(exc)
             return None
+        self.link.sound.net_response(len(fetched.data))
         return self.send_file(filename, fetched.data)
 
     # -- transfer --------------------------------------------------------
