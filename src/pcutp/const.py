@@ -16,10 +16,10 @@ MAX_FILENAME_LEN = 64
 MAX_FILE_SIZE = 16 * 1024 * 1024  # 16 MiB
 
 MAX_RETRIES = 5          # per block, section 15
-ACK_TIMEOUT = 5.0        # seconds, section 16
+ACK_TIMEOUT = 15.0       # seconds; includes SD-card writes and recovery barriers
 MAX_TIMEOUTS = 5         # section 16
 LINE_TIMEOUT = 30.0      # generic control-line read timeout
-DATA_TIMEOUT = 10.0      # PicoCalc side: raw payload after a DATA header
+DATA_TIMEOUT = 20.0      # PicoCalc side: raw payload after a DATA header
 
 # Teardown (section 7 of docs/PCUTP-session.md). CLOSE is FIN, BYE is FIN-ACK,
 # and each direction closes independently.

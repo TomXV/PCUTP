@@ -334,8 +334,8 @@ TCP と同じく、**片方向ずつ独立に閉じる**。`CLOSE` は「私の�
 |---|---|---|
 | `BASE_BAUDRATE` | 115200 | `BASEBAUD` |
 | `DEFAULT_BLOCK_SIZE` | 4096 | `BLKMAX` |
-| `ACK_TIMEOUT` | 5.0s | `ACKTMO` |
-| `DATA_TIMEOUT` | 10.0s | `DATTMO` |
+| `ACK_TIMEOUT` | 15.0s | `ACKTMO` (SD-card writes and recovery barriers) |
+| `DATA_TIMEOUT` | 20.0s | `DATTMO` |
 | `HANDSHAKE_TIMEOUT` | 10.0s | `HSTMO` |
 | `CONNECT_DELAY` | 0.4s | — |
 | `KEEPALIVE_INTERVAL` | 5.0s | — |

@@ -198,6 +198,29 @@ def test_three_way_handshake_client_sends_sync_after_howru(tmp_path):
     assert maxblk == 512
 
 
+def test_server_repeats_howru_for_duplicate_hello():
+    pipe = PipePair()
+    pipe.left.read_timeout = pipe.right.read_timeout = 0.01
+    server = PcutpServer(Link(pipe.left), connect_delay=0.0)
+    peer = Link(pipe.right)
+    accepted = []
+
+    def server_side():
+        accepted.append(server._handle_hello(server.link.recv_line(5.0)))
+
+    thread = threading.Thread(target=server_side)
+    thread.start()
+    peer.send_line("HELLO PCUTP/2")
+    assert peer.recv_line(5.0) == "HOWRU"
+    peer.send_line("HELLO PCUTP/2")
+    assert peer.recv_line(5.0) == "HOWRU"
+    peer.send_line("SYNC FLOW=1 MAXBLK=4096 WINDOW=1 RXBUF=16384")
+    assert peer.recv_line(5.0).startswith("CONNECT ")
+    thread.join(5)
+
+    assert accepted == [True]
+
+
 def test_three_way_handshake_server_rejects_non_sync_ack(tmp_path):
     pipe = PipePair()
     pipe.left.read_timeout = pipe.right.read_timeout = 0.01

@@ -23,12 +23,13 @@ Const VER$      = "PCUTP/2"
 Const BLKMAX    = 4096
 Const RXBUFSZ   = 16384       ' holds the entire two-frame flight plus headers
 Const WINMAX    = 2           ' ACK releases one slot; no XON/XOFF in raw bytes
-Const ACKTMO    = 5000        ' ms, section 16
+Const ACKTMO    = 15000       ' ms, allow SD writes and recovery barriers
 Const CLSTMO    = 3000        ' ms to wait for BYE before resending CLOSE
 Const CLSRTY    = 3           ' CLOSE attempts before dropping the link
 Const LINGERMS  = 2000        ' ms to keep answering a repeated CLOSE
-Const DATTMO    = 10000       ' ms, raw payload after a DATA header
+Const DATTMO    = 20000       ' ms, raw payload after a DATA header
 Const HSTMO     = 10000       ' ms, dial-up handshake wait (HOWRU / CONNECT)
+Const HELLO_RETRIES = 3       ' repeat the initial call if the UART was late
 ' Single fixed line rate. Rate negotiation was removed after hardware testing:
 ' the Flipper USB-UART bridge carried 115200 reliably but corrupted 4096-byte
 ' blocks at faster rates, so the port stays open at BASEBAUD for the session.
@@ -42,6 +43,8 @@ Const KATMO     = 15000       ' ms of receive silence before the link is lost
 Const FETTMO    = 45000       ' ms of silence tolerated while FETCHING
 Const DEST$     = "B:/"       ' SD card destination directory (PicoMite: B: = SD)
 Const BEEP      = 1           ' 0 for a silent transfer
+Const DATA_SOUND_EVERY = 1    ' voice every DATA/ACK; PLAY TONE is asynchronous
+Const PROGRESS_MS = 100       ' redraw at most 10 times/s: live without stalling UART
 
 ' ---- audible protocol feedback ---------------------------------------
 ' Every control word has its own pitch, so the exchange can be followed by
@@ -77,8 +80,8 @@ Const HZ_ANSWER   = 587       ' <- answer tone (HOWRU)
 Const HZ_SYNC     = 1864      ' -> sync blip (SYNC, the handshake ACK)
 Const HZ_CONNECT  = 659       ' <- connected flourish (CONNECT)
 
-Const MS_WORD     = 45        ' a spoken control word
-Const MS_BLIP     = 12        ' the per-block pair, kept short
+Const MS_WORD     = 120       ' long enough for the PicoCalc speaker to be audible
+Const MS_BLIP     = 45        ' distinct DATA/ACK notes within the ~150 ms block cycle
 Const MS_DIAL     = 260       ' the dial tone, longer than a word
 
 ' RENAME refuses a path on a drive other than the current one, even when
@@ -90,7 +93,7 @@ Dim unpack%(BLKMAX \ 8)       ' bounded output for independent LZ4 blocks
 Dim rtab%(255)                ' byte-reflect table, for chaining MATH(CRC32 ...)
 
 Dim s$, fn$, url$, meta$(5)
-Dim size, blksz, blocks, seq, ln, want$, got$
+Dim size, blksz, blocks, seq, ln, want$, got$, helloTry
 Dim fcrc, running, i, n, retries, wpos, wchunk, rcvd
 Dim crcBlockOut, crcRunningOut
 Dim ws$
@@ -99,6 +102,7 @@ Dim kaWin                     ' current link-loss window, ms (KATMO or FETTMO)
 Dim peerDone                  ' the uConsole has closed its half of the session
 Dim flowOn, winsz             ' optional bounded-window extension
 Dim zipOn, rawlen, zipped
+Dim lastProgress
 
 BuildReflect                  ' must run after rtab%() is dimensioned
 
@@ -125,14 +129,22 @@ Print "PCUTP v2.1"
 ' carrier up and negotiates MAXBLK. ERR ... (notably ERR VERSION) is the
 ' refusal.
 Print "Dialing..."
-Tone1 HZ_DIAL, 80
-Pause 100
-Tone1 1209, 80
-Pause 100
-Tone1 1477, 100
-Pause 130
-Print #1, "HELLO " + VER$
-s$ = RecvLine$(HSTMO)
+For helloTry = 1 To HELLO_RETRIES
+  Print "HELLO " + Str$(helloTry) + "/" + Str$(HELLO_RETRIES)
+  Tone1 HZ_DIAL, 80
+  Pause 100
+  Tone1 1209, 80
+  Pause 100
+  Tone1 1477, 100
+  Pause 130
+  Print #1, "HELLO " + VER$
+  ' A silent peer is expected during the initial call.  Restart the
+  ' liveness clock for every attempt so KATMO does not cut off retries.
+  lastRx = Timer
+  s$ = RecvLine$(HSTMO)
+  If s$ = "HOWRU" Then Exit For
+  If helloTry < HELLO_RETRIES Then Pause 250
+Next helloTry
 If Left$(s$, 3) = "ERR" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print s$: End
 If s$ <> "HOWRU" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print " no answer tone": End
 Tone1 HZ_ANSWER, MS_WORD
@@ -224,6 +236,7 @@ Do
   running = 0
   seq = 0
   rcvd = 0
+  lastProgress = Timer
   Do
     s$ = RecvLine$(2 * ACKTMO)
     If Left$(s$, 3) = "ERR" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Close #2: Print s$: End
@@ -243,7 +256,7 @@ Do
     zipped = 0
     If zipOn And meta$(0) = "ZDATA" Then zipped = 1
     If Not zipped And meta$(0) <> "DATA" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Close #2: Print "protocol error": End
-    Tone1 HZ_RX_DATA, MS_BLIP
+    If (seq Mod DATA_SOUND_EVERY) = 0 Then Tone1 HZ_RX_DATA, MS_BLIP
     n     = Val(meta$(1))
     ln    = Val(meta$(2))
     want$ = UCase$(meta$(3))
@@ -298,8 +311,11 @@ Do
     ' which made the counter overshoot the file size.
     rcvd = rcvd + ln
     Print #1, "ACK " + Str$(n)
-    Tone1 HZ_TX_ACK, MS_BLIP
-    Print Chr$(13) + Str$(rcvd) + " / " + Str$(size) + " bytes";
+    If (seq Mod DATA_SOUND_EVERY) = 0 Or rcvd = size Then Tone1 HZ_TX_ACK, MS_BLIP
+    If Timer - lastProgress >= PROGRESS_MS Or rcvd = size Then
+      Print Chr$(13) + Str$(rcvd) + " / " + Str$(size) + " bytes";
+      lastProgress = Timer
+    EndIf
   Loop
   Print
 

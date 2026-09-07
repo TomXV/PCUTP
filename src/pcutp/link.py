@@ -86,6 +86,11 @@ class Link:
                 del self._buf[: idx + 1]
                 text = line.decode("ascii", errors="replace").strip("\r")
                 if text in ("PING", "PONG"):
+                    # Keep-alive lines are transparent to the protocol state
+                    # machine, but they must remain visible in --trace output
+                    # so an operator can tell that the link is alive.
+                    if self.trace:
+                        self.log(f"RX< {text}")
                     self.sound.line(text)
                     if text == "PING":
                         self.send_line("PONG")

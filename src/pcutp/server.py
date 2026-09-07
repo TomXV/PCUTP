@@ -150,7 +150,17 @@ class PcutpServer:
         self.link.send_line("HOWRU")
         self.link.sound.handshake_ring()
         self.link.sound.handshake_carrier()
-        reply = self.link.recv_line(const.HANDSHAKE_TIMEOUT)
+        deadline = time.monotonic() + const.HANDSHAKE_TIMEOUT
+        while True:
+            reply = self.link.recv_line(max(0, deadline - time.monotonic()))
+            # HOWRU can be lost just as the receiver's HELLO timer expires.
+            # Treat the resulting duplicate HELLO as a repeated call instead
+            # of rejecting it while waiting for SYNC.
+            if reply == f"HELLO {const.PROTOCOL_VERSION}":
+                self.link.send_line("HOWRU")
+                deadline = time.monotonic() + const.HANDSHAKE_TIMEOUT
+                continue
+            break
         sync = reply.split()
         if not sync or sync[0] != "SYNC":
             self._fail(ProtocolError(f"expected SYNC, got {reply!r}"))

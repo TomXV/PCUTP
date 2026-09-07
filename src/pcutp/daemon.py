@@ -29,6 +29,8 @@ class Console:
     def __init__(self, show_bar: bool = True):
         self.show_bar = show_bar
         self._bar = ""
+        self._last_progress_at = 0.0
+        self._last_progress_bytes = 0
 
     def log(self, text: str) -> None:
         print(f"\r\033[K{text}" if self._bar else text, flush=True)
@@ -38,6 +40,12 @@ class Console:
     def progress(self, done: int, total: int) -> None:
         if not self.show_bar:
             return
+        now = time.monotonic()
+        if (done != total and done - self._last_progress_bytes < 65536
+                and now - self._last_progress_at < 0.25):
+            return
+        self._last_progress_at = now
+        self._last_progress_bytes = done
         pct = 100 if total == 0 else done * 100 // total
         filled = pct * 20 // 100
         bar = "#" * filled + "-" * (20 - filled)
@@ -49,6 +57,8 @@ class Console:
         if self._bar:
             print()
             self._bar = ""
+            self._last_progress_at = 0.0
+            self._last_progress_bytes = 0
         print(text, flush=True)
 
 
