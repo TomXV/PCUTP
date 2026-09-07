@@ -10,7 +10,7 @@ from pathlib import Path
 from . import __version__, const
 from . import sound as sound_mod
 from .client import PcutpClient
-from .errors import PcutpError
+from .errors import LinkLostError, PcutpError
 from .fetcher import Fetched
 from .link import Link
 from .server import PcutpServer
@@ -103,34 +103,51 @@ def run_serial(args: argparse.Namespace) -> int:
     sound = Sound(enabled=args.sound)
     console = Console(show_bar=not args.quiet)
     link = Link(transport, trace=args.trace, sound=sound, log=console.log)
+
+    def report(result) -> None:
+        status = "verified" if result.verified else "CRC MISMATCH"
+        console.done(
+            f"{result.filename}: {result.size} bytes in {result.blocks} blocks, "
+            f"{result.retransmits} retransmit(s), {status}"
+        )
+
     server = PcutpServer(
         link,
         block_size=args.block,
         max_file_size=args.max_size,
+        baud=args.baud,
+        keepalive_interval=args.keepalive_interval,
+        keepalive_timeout=args.keepalive_timeout,
         on_progress=None if args.quiet else console.progress,
+        on_result=report,
     )
     print(f"pcutpd {__version__} on {port} @ {args.baud} 8N1 (Ctrl-C to stop)")
     try:
         while True:
             try:
-                result = server.serve_once(timeout=args.idle_timeout)
+                server.serve_once(timeout=args.idle_timeout)
+            except LinkLostError:
+                console.done("link lost")
+                link.discard_input()
+                continue
             except PcutpError as exc:
                 console.done(f"transfer failed: {exc}")
                 link.discard_input()
                 continue
-            if result is None:
-                continue
-            status = "verified" if result.verified else "CRC MISMATCH"
-            console.done(
-                f"{result.filename}: {result.size} bytes in {result.blocks} blocks, "
-                f"{result.retransmits} retransmit(s), {status}"
-            )
     except KeyboardInterrupt:
         print("\nstopped")
         return 0
     finally:
         sound.close()
         transport.close()
+
+
+def _selftest_server(server: PcutpServer) -> None:
+    """Run serve_once until the session ends; link loss is a normal stop."""
+    try:
+        server.serve_once(timeout=10.0)
+    except LinkLostError:
+        pass
 
 
 def run_selftest(args: argparse.Namespace) -> int:
@@ -141,8 +158,11 @@ def run_selftest(args: argparse.Namespace) -> int:
         Link(pipe.left, trace=args.trace),
         fetcher=lambda url, max_size=const.MAX_FILE_SIZE: Fetched(payload, url),
         block_size=args.block,
+        connect_delay=0.0,
+        keepalive_interval=0.1,
+        keepalive_timeout=0.5,
     )
-    thread = threading.Thread(target=server.serve_once, kwargs={"timeout": 10.0})
+    thread = threading.Thread(target=_selftest_server, args=(server,))
     thread.start()
     with tempfile.TemporaryDirectory() as tmp:
         console = Console(show_bar=not args.quiet)
@@ -152,12 +172,15 @@ def run_selftest(args: argparse.Namespace) -> int:
             on_progress=None if args.quiet else console.progress,
         )
         client.hello()
-        download = client.get("SELFTEST.BIN", "https://example.invalid/selftest.bin")
-        thread.join()
+        first = client.get("SELFTEST.BIN", "https://example.invalid/selftest.bin")
+        second = client.get("SECOND.BIN", "https://example.invalid/second.bin")
+        client.close()
+        thread.join(5)
         print()
-        got = Path(download.path).read_bytes()
-        ok = download.ok and got == payload
-        print(f"selftest: {'OK' if ok else 'FAILED'} ({len(got)} bytes)")
+        got1 = Path(first.path).read_bytes()
+        got2 = Path(second.path).read_bytes()
+        ok = first.ok and second.ok and got1 == payload and got2 == payload
+        print(f"selftest: {'OK' if ok else 'FAILED'} ({len(got1)}+{len(got2)} bytes)")
         return 0 if ok else 1
 
 
@@ -185,6 +208,24 @@ def run_sounds(args: argparse.Namespace) -> int:
     ):
         print(f"  {name:<8} {label}")
         sound.effect(name)
+        time.sleep(0.9)
+    print("\nthe handshake (dial-up answer)")
+    for name, label in (
+        ("ring", "HOWRU answer tone"),
+        ("carrier", "CONNECT negotiation"),
+        ("connected", "CONNECT flourish"),
+    ):
+        print(f"  {name:<10} {label}")
+        getattr(sound, f"handshake_{name}")()
+        time.sleep(0.9)
+    print("\nsession effects")
+    for name, label in (
+        ("dial", "DTMF dialling out on HELLO"),
+        ("fanfare", "transfer verified"),
+        ("disconnect", "graceful hangup on CLOSE"),
+    ):
+        print(f"  {name:<10} {label}")
+        getattr(sound, name)()
         time.sleep(0.9)
     for kind in sound_mod.NET_ERROR_HZ:
         print(f"  {kind:<10} fetch failed")
@@ -233,9 +274,22 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="serial port, or 'auto' to pick the only USB adapter attached",
     )
-    serve.add_argument("--baud", type=int, default=const.DEFAULT_BAUDRATE)
+    serve.add_argument(
+        "--baud",
+        type=int,
+        default=const.BASE_BAUDRATE,
+        help="rate the handshake runs on, and the fallback when a faster one fails",
+    )
     serve.add_argument("--max-size", type=int, default=const.MAX_FILE_SIZE)
     serve.add_argument("--idle-timeout", type=float, default=3600.0)
+    serve.add_argument(
+        "--keepalive-interval", type=float, default=const.KEEPALIVE_INTERVAL,
+        help="idle seconds before sending a PING probe",
+    )
+    serve.add_argument(
+        "--keepalive-timeout", type=float, default=const.KEEPALIVE_TIMEOUT,
+        help="silent seconds before declaring the link lost",
+    )
     serve.add_argument(
         "--sound",
         action="store_true",

@@ -1,4 +1,4 @@
-"""PicoCalc side of PCUTP v0.1, in Python.
+"""PicoCalc side of PCUTP v0.2, in Python.
 
 This is the reference receiver: it mirrors what PCUTP.BAS must do, and lets
 the whole protocol be exercised in CI without any hardware.
@@ -45,16 +45,24 @@ class PcutpClient:
         self.free_space = free_space
         self.on_progress = on_progress
 
-    def hello(self, timeout: float = const.LINE_TIMEOUT) -> int:
+    def hello(self, timeout: float = const.HANDSHAKE_TIMEOUT) -> int:
+        """Dial in: expect HOWRU (answer tone) then CONNECT (carrier up).
+
+        Returns the MAXBLK block size negotiated by the server.
+        """
         self.link.send_line(f"HELLO {const.PROTOCOL_VERSION}")
-        reply = self.link.recv_line(timeout)
-        parts = reply.split()
-        if parts[:1] == ["ERR"]:
-            raise PcutpError(reply, code=parts[1] if len(parts) > 1 else "PROTOCOL")
-        if parts[:3] != ["HELLO", const.PROTOCOL_VERSION, "OK"]:
-            raise ProtocolError(f"bad HELLO reply: {reply!r}")
+        howru = self.link.recv_line(timeout)
+        self._raise_for_err(howru)
+        if howru != "HOWRU":
+            raise ProtocolError(f"expected HOWRU, got {howru!r}")
+        self.link.send_line("SYNC")
+        connect = self.link.recv_line(timeout)
+        self._raise_for_err(connect)
+        parts = connect.split()
+        if len(parts) < 2 or parts[0] != "CONNECT":
+            raise ProtocolError(f"expected CONNECT, got {connect!r}")
         maxblk = const.DEFAULT_BLOCK_SIZE
-        for token in parts[3:]:
+        for token in parts[2:]:
             if token.startswith("MAXBLK="):
                 maxblk = int(token.split("=", 1)[1])
         return maxblk
@@ -64,12 +72,28 @@ class PcutpClient:
         meta = self._recv_meta(timeout)
         return self._receive(meta)
 
+    def close(self) -> None:
+        """Hang up cleanly: send CLOSE so the sender returns to IDLE."""
+        self.link.send_line("CLOSE")
+
     # -- internals -------------------------------------------------------
-    def _recv_meta(self, timeout: float) -> Meta:
-        line = self.link.recv_line(timeout)
+    @staticmethod
+    def _raise_for_err(line: str) -> None:
         parts = line.split()
         if parts[:1] == ["ERR"]:
             raise PcutpError(line, code=parts[1] if len(parts) > 1 else "PROTOCOL")
+
+    def _recv_meta(self, timeout: float) -> Meta:
+        line = self.link.recv_line(timeout)
+        self._raise_for_err(line)
+        if line == "FETCHING":
+            # The server accepted the request and is on the internet now. It
+            # cannot send anything until the body is in hand, so wait out the
+            # whole fetch rather than treating the silence as a dead link.
+            # A server that omits FETCHING still works: META arrives here.
+            line = self.link.recv_line(const.FETCH_TIMEOUT)
+            self._raise_for_err(line)
+        parts = line.split()
         if len(parts) != 6 or parts[0] != "META":
             raise ProtocolError(f"expected META, got {line!r}")
         return Meta(
@@ -95,11 +119,8 @@ class PcutpClient:
         with open(part, "wb") as handle:
             while expected < meta.blocks:
                 header = self.link.recv_line(const.ACK_TIMEOUT * 2)
+                self._raise_for_err(header)
                 parts = header.split()
-                if parts[:1] == ["ERR"]:
-                    raise PcutpError(
-                        header, code=parts[1] if len(parts) > 1 else "PROTOCOL"
-                    )
                 if len(parts) != 4 or parts[0] != "DATA":
                     raise ProtocolError(f"expected DATA, got {header!r}")
                 seq, length, want = int(parts[1]), int(parts[2]), parts[3].upper()

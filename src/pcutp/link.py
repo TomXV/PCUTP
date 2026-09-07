@@ -6,13 +6,27 @@ count, never by delimiter, so binary data containing 0x0A is safe.
 
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from .const import LF
-from .errors import ProtocolError, TimeoutError_
+from .errors import LinkLostError, ProtocolError, TimeoutError_
 from .sound import Sound
 from .transport import Transport
 
 MAX_LINE_LEN = 512
+
+
+@dataclass(frozen=True)
+class KeepAlive:
+    """Liveness parameters for the keep-alive mode of recv_line.
+
+    While waiting for a control line, a PING is sent after `interval`
+    seconds with no bytes received (at most once per interval), and the
+    link is declared lost after `timeout` seconds of silence.
+    """
+
+    interval: float
+    timeout: float
 
 
 class Link:
@@ -50,8 +64,18 @@ class Link:
         self.t.write(line.encode("ascii") + LF + data)
 
     # -- receiving -------------------------------------------------------
-    def recv_line(self, timeout: float) -> str:
+    def recv_line(self, timeout: float, keepalive: "KeepAlive | None" = None) -> str:
+        """Read one control line.
+
+        PING/PONG are always handled transparently (a PING is answered with
+        PONG, a PONG just notes liveness) so they never surface to the
+        server/client state machine. With `keepalive` set, a PING is also
+        sent every `interval` of silence and, past `timeout` of silence,
+        LinkLostError is raised.
+        """
         deadline = time.monotonic() + timeout
+        last_rx = time.monotonic()
+        last_ping = time.monotonic()
         while True:
             idx = self._buf.find(LF)
             if idx >= 0:
@@ -60,17 +84,31 @@ class Link:
                 line = bytes(self._buf[:idx]).lstrip(b"\x00")
                 del self._buf[: idx + 1]
                 text = line.decode("ascii", errors="replace").strip("\r")
+                if text in ("PING", "PONG"):
+                    if text == "PING":
+                        self.send_line("PONG")
+                    last_rx = time.monotonic()
+                    continue
                 if self.trace:
                     self.log(f"RX< {text}")
                 self.sound.line(text)
                 return text
             if len(self._buf) > MAX_LINE_LEN:
                 raise ProtocolError("control line too long")
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if keepalive is not None:
+                idle = now - last_rx
+                if idle >= keepalive.timeout:
+                    raise LinkLostError(f"no bytes received for {idle:.1f}s")
+                if idle >= keepalive.interval and now - last_ping >= keepalive.interval:
+                    self.send_line("PING")
+                    last_ping = now
+            if now >= deadline:
                 raise TimeoutError_("timed out waiting for a control line")
             chunk = self.t.read(64)
             if chunk:
                 self._buf.extend(chunk)
+                last_rx = time.monotonic()
 
     def recv_exact(self, size: int, timeout: float) -> bytes:
         deadline = time.monotonic() + timeout

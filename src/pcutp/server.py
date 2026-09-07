@@ -1,5 +1,6 @@
-"""uConsole side of PCUTP v0.1: the sender / gateway (sections 5-17)."""
+"""uConsole side of PCUTP v0.2: the sender / gateway (sections 5-17)."""
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -13,7 +14,7 @@ from .errors import (
     VersionError,
 )
 from .fetcher import Fetched, fetch
-from .link import Link
+from .link import KeepAlive, Link
 from .names import sanitize_filename
 
 
@@ -39,6 +40,11 @@ class PcutpServer:
         ack_timeout: float = const.ACK_TIMEOUT,
         max_retries: int = const.MAX_RETRIES,
         on_progress: "Callable[[int, int], None] | None" = None,
+        on_result: "Callable[[TransferResult], None] | None" = None,
+        baud: int = const.BASE_BAUDRATE,
+        connect_delay: float = const.CONNECT_DELAY,
+        keepalive_interval: float = const.KEEPALIVE_INTERVAL,
+        keepalive_timeout: float = const.KEEPALIVE_TIMEOUT,
     ):
         self.link = link
         self.fetcher = fetcher
@@ -47,15 +53,48 @@ class PcutpServer:
         self.ack_timeout = ack_timeout
         self.max_retries = max_retries
         self.on_progress = on_progress
+        self.on_result = on_result
+        # The single line rate for the whole session. Negotiation was removed
+        # after hardware testing showed the Flipper USB-UART bridge only
+        # carries 115200 reliably; faster rates passed short probes but
+        # corrupted 4096-byte blocks, so a fixed rate is the honest choice.
+        self.baud = baud
+        self.connect_delay = connect_delay
+        self.keepalive = KeepAlive(keepalive_interval, keepalive_timeout)
+        # A line read but not yet consumed; serve_once takes it next time.
+        self._pending: str | None = None
 
     # -- top level -------------------------------------------------------
-    def serve_once(self, timeout: float = const.LINE_TIMEOUT) -> "TransferResult | None":
-        """Handle one HELLO..DONE exchange. Returns None if the peer gave up."""
+    def serve_once(self, timeout: float = const.LINE_TIMEOUT) -> None:
+        """HELLO..CONNECT handshake, then GETs until the link is lost.
+
+        Returns None if the handshake fails; otherwise it keeps serving GETs
+        (reporting each via on_result) until LinkLostError or a protocol
+        error ends the session. A bare CLOSE ends the session cleanly (back
+        to IDLE); a fresh HELLO mid-session re-runs the handshake.
+        """
+        self._pending = None
         line = self.link.recv_line(timeout)
         if not self._handle_hello(line):
-            return None
-        request = self.link.recv_line(timeout)
-        return self._handle_get(request)
+            return
+        while True:
+            if self._pending is not None:
+                request, self._pending = self._pending, None
+            else:
+                request = self.link.recv_line(timeout, keepalive=self.keepalive)
+            if request == "CLOSE":
+                self.link.sound.disconnect()
+                self.link.log("session closed by peer")
+                return
+            if request.startswith("HELLO "):
+                # Peer restarted mid-session: re-run the handshake and keep
+                # serving, rather than treating it as a protocol error.
+                if not self._handle_hello(request):
+                    return
+                continue
+            result = self._handle_get(request)
+            if result is not None and self.on_result is not None:
+                self.on_result(result)
 
     def _handle_hello(self, line: str) -> bool:
         parts = line.split()
@@ -65,18 +104,34 @@ class PcutpServer:
         if parts[1] != const.PROTOCOL_VERSION:
             self._fail(VersionError(f"unsupported version {parts[1]!r}"))
             return False
-        self.link.send_line(
-            f"HELLO {const.PROTOCOL_VERSION} OK MAXBLK={self.block_size}"
-        )
+        self.link.sound.dial()
+        self.link.send_line("HOWRU")
+        self.link.sound.handshake_ring()
+        self.link.sound.handshake_carrier()
+        reply = self.link.recv_line(const.HANDSHAKE_TIMEOUT)
+        sync = reply.split()
+        if not sync or sync[0] != "SYNC":
+            self._fail(ProtocolError(f"expected SYNC, got {reply!r}"))
+            return False
+        time.sleep(self.connect_delay)
+        self.link.send_line(f"CONNECT {self.baud} MAXBLK={self.block_size}")
+        self.link.sound.handshake_connected()
         return True
 
     def _handle_get(self, line: str) -> "TransferResult | None":
         parts = line.split()
         if len(parts) != 3 or parts[0] != "GET":
-            self._fail(ProtocolError(f"expected GET, got {line!r}"))
-            return None
+            exc = ProtocolError(f"expected GET, got {line!r}")
+            self._fail(exc)
+            raise exc
         try:
             filename = sanitize_filename(parts[1])
+            # Nothing crosses the wire for as long as the fetch takes, which
+            # is a healthy link that has gone silent - indistinguishable, to
+            # the receiver's link-loss timer, from a dead one. FETCHING says
+            # "still here, on the internet now" so the receiver can widen its
+            # window for the META that follows (section 16.4).
+            self.link.send_line("FETCHING")
             # The one point where this side actually talks to the internet;
             # sounding it here keeps the HTTP leg audible without threading a
             # callback through the fetcher.
@@ -113,6 +168,8 @@ class PcutpServer:
         self.link.send_line(f"DONE {file_crc}")
         final = self.link.recv_line(self.ack_timeout)
         verified = final.split()[:2] == ["OK", file_crc]
+        if verified:
+            self.link.sound.fanfare()
         return TransferResult(
             filename=filename,
             size=size,

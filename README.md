@@ -1,6 +1,6 @@
 # PCUTP
 
-**PicoCalc / uConsole UART File Transfer Protocol** — v0.1
+**PicoCalc / uConsole UART File Transfer Protocol** — v0.2
 
 PCUTPは、**インターネット接続機能を持たないデバイスに、UART経由でネットワーク機能を持たせるための軽量プロトコル**です。
 
@@ -23,7 +23,8 @@ PicoCalc
 SDカード
 ```
 
-完全なプロトコル仕様は [`docs/PCUTP-0.1.md`](docs/PCUTP-0.1.md) を参照してください。
+完全なプロトコル仕様は [`docs/PCUTP-0.2.md`](docs/PCUTP-0.2.md) を参照してください。
+旧版は [`docs/PCUTP-0.1.md`](docs/PCUTP-0.1.md) に残してあります。
 
 ## このプロジェクトは何ですか？
 
@@ -362,32 +363,51 @@ TEST.BAS
 
 ## 現在のプロトコル
 
-PCUTP v0.1では、現在以下の制御語を使用します。
+PCUTP v0.2では、現在以下の制御語を使用します。
 
 ```text
-HELLO
-GET
-META
-READY
-DATA
-ACK
-NAK
-DONE
-OK
-ERR
+接続         HELLO     発呼
+             HOWRU     応答トーン
+             SYNC      応答確認
+             CONNECT   キャリア確立（ベース速度・MAXBLKを通知）
+
+転送         GET       ダウンロード要求
+             FETCHING  受理。これからインターネットに出る
+             META      ファイル情報（サイズ・ブロック数・CRC32）
+             READY     受信準備完了
+             DATA      データブロック（この後にRAWバイナリ）
+             ACK       ブロック受領
+             NAK       ブロック再送要求
+             DONE      全ブロック送信完了
+             OK        ファイル全体のCRC32一致
+             ERR       エラー
+
+維持         PING      生存確認
+             PONG      応答
+             CLOSE     正常切断
 ```
+
+v0.1から追加されたのは `HOWRU` `SYNC` `CONNECT` `FETCHING` `PING` `PONG` `CLOSE` の7語です。
+これにより、**1回の接続で複数のファイルを続けてダウンロードできる**ようになり
+（v0.1では1ファイルごとに接続をやり直していました）、
+回線が切れたことを検出できるようになりました。
+
+回線速度は **115200 baud 固定**です。かつて v0.2 は `RATE`/`PROBE` による速度
+ネゴシエーションを備えていましたが、実機検証で Flipper Zero の USB-UART ブリッジが
+115200 しか安定して通さない（短いプローブは速くても、4096 バイトの実ブロックが
+破損する）ことが分かったため、廃止しました。
 
 標準UART設定：
 
 ```text
-460800 baud
+115200 baud
 8 data bits
 No parity
 1 stop bit
 No flow control
 ```
 
-つまり **460800 8N1** です。
+つまり **115200 8N1** です。
 
 標準ブロックサイズは **4096 bytes** です。
 
@@ -442,7 +462,8 @@ PicoCalc側はPicoMite BASICで実装されています。
 | `picocalc/PCUTP.BAS` | PicoMite BASIC製のPicoCalc受信実装 |
 | `tests/` | インメモリUARTを使用した単体・E2Eテスト |
 | `Dockerfile` | ローカル・CI共通のビルド／テスト環境 |
-| `docs/PCUTP-0.1.md` | PCUTP v0.1 プロトコル仕様書 |
+| `docs/PCUTP-0.2.md` | PCUTP v0.2 プロトコル仕様書（現行） |
+| `docs/PCUTP-0.1.md` | PCUTP v0.1 プロトコル仕様書（旧版・参考） |
 
 ## 実機構成
 
@@ -452,7 +473,7 @@ PicoCalc側はPicoMite BASICで実装されています。
 PicoCalc Core GPIO
 GP4 / GP5
      │
-     │ UART 460800 8N1
+     │ UART 115200 8N1
      ▼
 uConsole
 ```
