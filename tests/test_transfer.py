@@ -192,9 +192,9 @@ def test_three_way_handshake_client_sends_sync_after_howru(tmp_path):
     thread.join(5)
 
     assert seen["hello"] == "HELLO PCUTP/2"
-    # SYNC is the client's ACK of the howru tone; rate negotiation is gone, so
-    # it is a bare SYNC with no RATES= payload.
-    assert seen["sync"] == "SYNC"
+    # Capabilities accompany SYNC; an old sender can ignore them safely.
+    assert seen["sync"] == "SYNC FLOW=1 MAXBLK=4096 WINDOW=2 RXBUF=16384 LZ4=1"
+    assert client.window_size == 1  # old CONNECT did not opt into FLOW
     assert maxblk == 512
 
 

@@ -1,6 +1,6 @@
-' PCUTP.BAS - PicoCalc side of PCUTP v0.2
+' PCUTP.BAS - PicoCalc side of PCUTP v2.1
 ' PicoMite BASIC (MMBasic 5.07+). Receives files over UART from pcutpd
-' running on the uConsole. See docs/PCUTP-0.2.md for the wire protocol.
+' running on the uConsole. See docs/PCUTP-flow.md for flow control and compression.
 '
 ' NOTE: this is the reference receiver; the Python client in src/pcutp/client.py
 ' implements the same state machine and is what CI exercises.
@@ -21,6 +21,8 @@ Option Default Integer
 
 Const VER$      = "PCUTP/2"
 Const BLKMAX    = 4096
+Const RXBUFSZ   = 16384       ' holds the entire two-frame flight plus headers
+Const WINMAX    = 2           ' ACK releases one slot; no XON/XOFF in raw bytes
 Const ACKTMO    = 5000        ' ms, section 16
 Const CLSTMO    = 3000        ' ms to wait for BYE before resending CLOSE
 Const CLSRTY    = 3           ' CLOSE attempts before dropping the link
@@ -84,6 +86,7 @@ Const MS_DIAL     = 260       ' the dial tone, longer than a word
 Drive "B:"
 
 Dim buf%(BLKMAX \ 8)          ' 8 bytes per 64-bit element
+Dim unpack%(BLKMAX \ 8)       ' bounded output for independent LZ4 blocks
 Dim rtab%(255)                ' byte-reflect table, for chaining MATH(CRC32 ...)
 
 Dim s$, fn$, url$, meta$(5)
@@ -94,6 +97,8 @@ Dim ws$
 Dim lastRx, maxblk            ' keep-alive liveness + negotiated block size
 Dim kaWin                     ' current link-loss window, ms (KATMO or FETTMO)
 Dim peerDone                  ' the uConsole has closed its half of the session
+Dim flowOn, winsz             ' optional bounded-window extension
+Dim zipOn, rawlen, zipped
 
 BuildReflect                  ' must run after rtab%() is dimensioned
 
@@ -108,11 +113,11 @@ BuildReflect                  ' must run after rtab%() is dimensioned
 ' dongle). Separate from the console's COM1 (GP0/GP1), so both ports can
 ' be open at once and OPTION SERIAL CONSOLE never needs touching.
 SetPin GP5, GP4, COM2
-Open "COM2:" + Str$(BASEBAUD) As #1
+Open "COM2:" + Str$(BASEBAUD) + "," + Str$(RXBUFSZ) As #1
 lastRx = Timer
 kaWin = KATMO
 
-Print "PCUTP v2"
+Print "PCUTP v2.1"
 
 ' ---- dial-up handshake -----------------------------------------------
 ' Ring out: send HELLO, expect the bare answer tone HOWRU, then confirm with
@@ -133,22 +138,32 @@ If s$ <> "HOWRU" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print " no answer tone"
 Tone1 HZ_ANSWER, MS_WORD
 Print "Carrier detected"
 Tone1 HZ_SYNC, MS_BLIP
-Print #1, "SYNC"
+Print #1, "SYNC FLOW=1 MAXBLK=" + Str$(BLKMAX) + " WINDOW=" + Str$(WINMAX) + " RXBUF=" + Str$(RXBUFSZ) + " LZ4=1"
 
 s$ = RecvLine$(HSTMO)
 If Left$(s$, 3) = "ERR" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print s$: End
 Split s$, meta$()                       ' CONNECT <baud> MAXBLK=<n>
 If meta$(0) <> "CONNECT" Or meta$(1) = "" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print " no carrier": End
 maxblk = BLKMAX
+winsz = 1
+flowOn = 0
+zipOn = 0
 For i = 2 To Bound(meta$(), 1)
   If Left$(meta$(i), 7) = "MAXBLK=" Then
     maxblk = Val(Mid$(meta$(i), 8))
-    If maxblk < 1 Or maxblk > BLKMAX Then maxblk = BLKMAX
+    If maxblk < 1 Or maxblk > BLKMAX Then Print "Invalid MAXBLK": End
   EndIf
+  If meta$(i) = "FLOW=1" Then flowOn = 1
+  If meta$(i) = "LZ4=1" Then zipOn = 1
+  If Left$(meta$(i), 7) = "WINDOW=" Then winsz = Val(Mid$(meta$(i), 8))
 Next i
+If Not flowOn Then winsz = 1
+If winsz < 1 Or winsz > WINMAX Then Print "Invalid WINDOW": End
+If winsz * (maxblk + 64) > RXBUFSZ Then Print "Invalid RXBUF": End
 Tone1 HZ_CONNECT, MS_WORD
 Print "CONNECT " + meta$(1)
 Print "MAXBLK=" + Str$(maxblk)
+Print "WINDOW=" + Str$(winsz)
 
 ' ---- session loop -----------------------------------------------------
 ' The connection stays up across downloads. An empty URL is the clean quit;
@@ -195,7 +210,10 @@ Do
   blocks = Val(meta$(4))
   fcrc   = HexVal(meta$(5))
 
-  If blksz > maxblk Then Tone1 HZ_TX_FAIL, MS_WORD: Print #1, "ERR PROTOCOL": End
+  If blksz < 1 Or blksz > maxblk Or size < 0 Or size > 16777216 Then Print #1, "ERR PROTOCOL": End
+  n = (size + blksz - 1) \ blksz
+  If n = 0 Then n = 1
+  If blocks <> n Then Print #1, "ERR PROTOCOL": End
 
   Open DEST$ + fn$ + ".PART" For Output As #2
   Print "Downloading..."
@@ -206,7 +224,7 @@ Do
   running = 0
   seq = 0
   rcvd = 0
-  Do While seq < blocks
+  Do
     s$ = RecvLine$(2 * ACKTMO)
     If Left$(s$, 3) = "ERR" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Close #2: Print s$: End
     ' The uConsole half-closing: no more files after this one, but this one
@@ -214,13 +232,26 @@ Do
     ' to complete perfectly well.
     If s$ = "CLOSE" Then Print #1, "BYE" : Tone1 HZ_BYE, MS_WORD : peerDone = 1 : Continue Do
     Split s$, meta$()                     ' DATA seq len crc
-    If meta$(0) <> "DATA" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Close #2: Print "protocol error": End
+    If meta$(0) = "DONE" Then
+      If seq <> blocks Then Print #1, "ERR PROTOCOL": Close #2: End
+      Exit Do
+    EndIf
+    If flowOn And meta$(0) = "BARRIER" Then
+      Print #1, "RESUME " + meta$(1) + " " + Str$(seq)
+      Continue Do
+    EndIf
+    zipped = 0
+    If zipOn And meta$(0) = "ZDATA" Then zipped = 1
+    If Not zipped And meta$(0) <> "DATA" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Close #2: Print "protocol error": End
     Tone1 HZ_RX_DATA, MS_BLIP
     n     = Val(meta$(1))
     ln    = Val(meta$(2))
     want$ = UCase$(meta$(3))
+    rawlen = ln
+    If zipped Then rawlen = Val(meta$(3)): want$ = UCase$(meta$(4))
 
-    If ln > blksz Then Tone1 HZ_TX_NAK, MS_WORD: Print #1, "NAK " + Str$(seq) + " SIZE": Continue Do
+    If ln < 0 Or ln > blksz Or n < 0 Or n >= blocks Then Print #1, "ERR PROTOCOL": Close #2: End
+    If rawlen < 0 Or rawlen > blksz Then Print #1, "ERR PROTOCOL": Close #2: End
 
     ' CrcBoth runs after the block is fully buffered: doing the native CRC
     ' per-chunk during reception (the first attempt) cost ~2x the line rate
@@ -229,13 +260,25 @@ Do
       Tone1 HZ_TX_FAIL, MS_WORD: SndFail: Print #1, "ERR TIMEOUT": Close #2: Print "timeout": End
     EndIf
 
+    If zipped Then
+      If Not UnpackLZ4(ln, rawlen) Then Print #1, "NAK " + Str$(seq) + " DECODE": Continue Do
+      ln = rawlen
+    EndIf
+
     ' Block CRC (fresh) and running whole-file CRC, both native MATH(CRC32 ...).
     CrcBoth 0, running, ln
 
-    If n <> seq Then Tone1 HZ_TX_NAK, MS_WORD: Print #1, "NAK " + Str$(seq) + " SEQ": Continue Do
-
     got$ = Hex$(crcBlockOut, 8)
     If got$ <> want$ Then Tone1 HZ_TX_NAK, MS_WORD: Print #1, "NAK " + Str$(seq) + " CRC": Continue Do
+    ' A duplicate is already committed: ACK again, never append/CRC twice.
+    If n < seq Then
+      If flowOn Then Print #1, "ACK " + Str$(seq - 1) Else Print #1, "ACK " + Str$(n)
+      Continue Do
+    EndIf
+    If n <> seq Then Tone1 HZ_TX_NAK, MS_WORD: Print #1, "NAK " + Str$(seq) + " SEQ": Continue Do
+    wchunk = size - rcvd
+    If wchunk > blksz Then wchunk = blksz
+    If ln <> wchunk Then Print #1, "ERR PROTOCOL": Close #2: End
 
     ' Write in <=255-byte chunks (MMBasic string cap) instead of one Print
     ' per byte - the per-byte Peek/Chr$/Print loop was the real bottleneck,
@@ -262,12 +305,11 @@ Do
 
   ' ---- final CRC -------------------------------------------------------
   Close #2
-  s$ = RecvLine$(ACKTMO)
   Split s$, meta$()
   If meta$(0) <> "DONE" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print "protocol error": End
   Tone1 HZ_RX_DONE, MS_WORD
 
-  If running <> fcrc Or running <> HexVal(meta$(1)) Then
+  If running <> fcrc Or running <> HexVal(meta$(1)) Or rcvd <> size Then
     Tone1 HZ_TX_FAIL, MS_WORD
     SndFail
     Print #1, "FAIL FILECRC " + Hex$(running, 8)
@@ -340,6 +382,61 @@ Sub Linger
 End Sub
 
 ' ---- helpers ---------------------------------------------------------
+' LZ4 block decoder. Check every input/output bound before MEMORY COPY.
+' Overlapping matches copy only already-produced bytes, doubling each time.
+' Corrupt compressed input returns false; the caller sends NAK and drains
+' the current flight through BARRIER before the sender can retry.
+Function UnpackLZ4(packedLen, plainLen)
+  Local ip, op, src, dst, tok, lit, ml, off, extra, count, fromp
+  src = Peek(VarAddr buf%(0))
+  dst = Peek(VarAddr unpack%(0))
+  ip = 0: op = 0
+  UnpackLZ4 = 0
+  Do While ip < packedLen
+    tok = Peek(Byte src + ip): ip = ip + 1
+    lit = tok >> 4
+    If lit = 15 Then
+      Do
+        If ip >= packedLen Then Exit Function
+        extra = Peek(Byte src + ip): ip = ip + 1
+        lit = lit + extra
+        If lit > plainLen Then Exit Function
+      Loop While extra = 255
+    EndIf
+    If ip + lit > packedLen Or op + lit > plainLen Then Exit Function
+    If lit > 0 Then Memory Copy src + ip, dst + op, lit
+    ip = ip + lit: op = op + lit
+    If ip = packedLen Then
+      If op <> plainLen Then Exit Function
+      If op > 0 Then Memory Copy dst, src, op
+      UnpackLZ4 = 1
+      Exit Function
+    EndIf
+    If ip + 2 > packedLen Then Exit Function
+    off = Peek(Byte src + ip) + 256 * Peek(Byte src + ip + 1)
+    ip = ip + 2
+    If off < 1 Or off > op Then Exit Function
+    ml = tok And 15
+    If ml = 15 Then
+      Do
+        If ip >= packedLen Then Exit Function
+        extra = Peek(Byte src + ip): ip = ip + 1
+        ml = ml + extra
+        If ml > plainLen Then Exit Function
+      Loop While extra = 255
+    EndIf
+    ml = ml + 4
+    If op + ml > plainLen Then Exit Function
+    fromp = op - off
+    Do While ml > 0
+      count = op - fromp
+      If count > ml Then count = ml
+      Memory Copy dst + fromp, dst + op, count
+      op = op + count: ml = ml - count
+    Loop
+  Loop
+End Function
+
 ' RecvLine$  : read one LF-terminated control line, or "" on timeout
 ' InputAlive$: non-blocking prompt + line edit that keeps answering PING
 ' RecvRaw    : read exactly `count` bytes into buf%() - never delimiter based

@@ -22,7 +22,9 @@ class SerialTransport:
     def __init__(self, port: str, baudrate: int, timeout: float = 0.2):
         import serial  # imported lazily so tests need no pyserial
 
-        self._ser = serial.Serial(port=port, baudrate=baudrate, timeout=timeout)
+        self._ser = serial.Serial(
+            port=port, baudrate=baudrate, timeout=timeout, write_timeout=10, exclusive=True,
+        )
 
     def read(self, size: int) -> bytes:
         # pyserial's read(n) waits up to the port timeout trying to fill all

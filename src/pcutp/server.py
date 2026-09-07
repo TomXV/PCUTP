@@ -1,10 +1,11 @@
-"""uConsole side of PCUTP v0.2: the sender / gateway (sections 5-17)."""
+"""uConsole side of PCUTP v2.1: the sender / gateway (sections 5-17)."""
 
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
 from . import const
+from .compression import compress, worthwhile
 from .crc import crc32_hex
 from .errors import (
     PcutpError,
@@ -14,6 +15,7 @@ from .errors import (
     VersionError,
 )
 from .fetcher import Fetched, fetch
+from .flow import FRAME_OVERHEAD, MAX_WINDOW, choose_block, options
 from .link import KeepAlive, Link
 from .names import sanitize_filename
 
@@ -26,6 +28,8 @@ class TransferResult:
     crc32: str
     retransmits: int
     verified: bool
+    compressed_blocks: int = 0
+    data_wire_bytes: int = 0
 
 
 class PcutpServer:
@@ -35,7 +39,7 @@ class PcutpServer:
         self,
         link: Link,
         fetcher: Callable[..., Fetched] = fetch,
-        block_size: int = const.DEFAULT_BLOCK_SIZE,
+        block_size: int | None = None,
         max_file_size: int = const.MAX_FILE_SIZE,
         ack_timeout: float = const.ACK_TIMEOUT,
         max_retries: int = const.MAX_RETRIES,
@@ -45,10 +49,27 @@ class PcutpServer:
         connect_delay: float = const.CONNECT_DELAY,
         keepalive_interval: float = const.KEEPALIVE_INTERVAL,
         keepalive_timeout: float = const.KEEPALIVE_TIMEOUT,
+        window_size: int = MAX_WINDOW,
+        compression: bool = True,
     ):
         self.link = link
         self.fetcher = fetcher
-        self.block_size = min(block_size, const.MAX_BLOCK_SIZE)
+        self.auto_block = block_size is None
+        if block_size is None:
+            block_size = const.MAX_BLOCK_SIZE
+        if block_size < 1 or not 1 <= window_size <= MAX_WINDOW:
+            raise ValueError("invalid block or window size")
+        self.block_limit = min(block_size, const.MAX_BLOCK_SIZE)
+        self.block_size = self.block_limit
+        self.negotiated_block_limit = self.block_limit
+        self.window_limit = window_size
+        self.window_size = 1
+        self.flow = False
+        self._barrier_id = 0
+        self.compression_enabled = compression
+        self.compression = False
+        self._use_compression = False
+        self.compressed_blocks = self.data_wire_bytes = 0
         self.max_file_size = max_file_size
         self.ack_timeout = ack_timeout
         self.max_retries = max_retries
@@ -134,8 +155,24 @@ class PcutpServer:
         if not sync or sync[0] != "SYNC":
             self._fail(ProtocolError(f"expected SYNC, got {reply!r}"))
             return False
+        capabilities = options(sync[1:])
+        self.block_size = min(self.block_limit, capabilities.get("MAXBLK", self.block_limit))
+        self.negotiated_block_limit = self.block_size
+        self.flow = capabilities.get("FLOW") == 1
+        self.compression = (self.flow and self.compression_enabled
+                            and capabilities.get("LZ4") == 1)
+        self.window_size = 1
+        extra = ""
+        if self.flow:
+            capacity = capabilities.get("RXBUF", 0) // (self.block_size + FRAME_OVERHEAD)
+            if capacity < 1:
+                raise ProtocolError("receiver buffer cannot hold one frame")
+            self.window_size = min(self.window_limit, capabilities.get("WINDOW", 1), capacity)
+            extra = f" FLOW=1 WINDOW={self.window_size}"
+            if self.compression:
+                extra += " LZ4=1"
         time.sleep(self.connect_delay)
-        self.link.send_line(f"CONNECT {self.baud} MAXBLK={self.block_size}")
+        self.link.send_line(f"CONNECT {self.baud} MAXBLK={self.block_size}{extra}")
         self.link.sound.handshake_connected()
         return True
 
@@ -167,7 +204,26 @@ class PcutpServer:
 
     # -- transfer --------------------------------------------------------
     def send_file(self, filename: str, data: bytes) -> "TransferResult | None":
+        self.compressed_blocks = self.data_wire_bytes = 0
         size = len(data)
+        self._use_compression = self.compression
+        if self._use_compression:
+            # Avoid repeatedly attempting LZ4 on compressed/high-entropy data.
+            # A sample can miss later repetition; raw fallback is always valid.
+            sample = min(1024, self.negotiated_block_limit)
+            starts = {0, max(0, size // 2 - sample // 2), max(0, size - sample)}
+            self._use_compression = any(compress(data[s:s + sample])[1] for s in starts)
+        if self.auto_block:
+            self.block_size = choose_block(
+                size, self.negotiated_block_limit, self.window_size, self.baud,
+            )
+            # Repeated data benefits from the longer LZ4 history. Sample at
+            # three positions, without adding probe traffic to the UART.
+            if self._use_compression:
+                limit = self.negotiated_block_limit
+                starts = {0, max(0, size // 2 - limit // 2), max(0, size - limit)}
+                if any(worthwhile(data[start:start + limit], self.baud) for start in starts):
+                    self.block_size = limit
         blocks = max(1, -(-size // self.block_size))  # ceil; empty file = 1 block
         file_crc = crc32_hex(data)
         self.link.send_line(
@@ -180,14 +236,34 @@ class PcutpServer:
             return None
 
         retransmits = 0
-        for seq in range(blocks):
-            chunk = data[seq * self.block_size : (seq + 1) * self.block_size]
-            retransmits += self._send_block(seq, chunk)
-            if self.on_progress:
-                self.on_progress(min((seq + 1) * self.block_size, size), size)
+        if self.flow:
+            try:
+                retransmits = self._send_window(data, blocks)
+            except PcutpError as exc:
+                self._fail(exc)
+                raise
+        else:
+            for seq in range(blocks):
+                chunk = data[seq * self.block_size : (seq + 1) * self.block_size]
+                retransmits += self._send_block(seq, chunk)
+                if self.on_progress:
+                    self.on_progress(min((seq + 1) * self.block_size, size), size)
 
         self.link.send_line(f"DONE {file_crc}")
-        final = self.link.recv_line(self.ack_timeout)
+        deadline = time.monotonic() + self.ack_timeout
+        while True:
+            final = self.link.recv_line(max(0, deadline - time.monotonic()))
+            parts = final.split()
+            if (self.flow and len(parts) == 2 and parts[0] == "ACK"
+                    and parts[1].isdecimal() and int(parts[1]) < blocks):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError_("no final file confirmation")
+                continue
+            if self.flow and self._old_resume(parts):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError_("no final file confirmation")
+                continue
+            break
         verified = final.split()[:2] == ["OK", file_crc]
         if verified:
             self.link.sound.fanfare()
@@ -198,13 +274,109 @@ class PcutpServer:
             crc32=file_crc,
             retransmits=retransmits,
             verified=verified,
+            compressed_blocks=self.compressed_blocks,
+            data_wire_bytes=self.data_wire_bytes,
         )
+
+    def _send_window(self, data: bytes, blocks: int) -> int:
+        """ACKs commit contiguous blocks and release one receive-buffer slot.
+
+        On a NAK/timeout, stop issuing DATA and drain the old flight with an
+        ordered barrier before retransmitting. Otherwise delayed ACKs and
+        repeated NAKs could create overlapping flights and overflow the UART.
+        """
+        base = next_seq = retransmits = recoveries = 0
+        attempts: dict[int, int] = {}
+        frames: dict[int, tuple[str, bytes]] = {}
+        while base < blocks:
+            while next_seq < min(blocks, base + self.window_size):
+                count = attempts.get(next_seq, 0)
+                if count > self.max_retries:
+                    raise RetryError(f"block {next_seq} exhausted retries")
+                attempts[next_seq] = count + 1
+                retransmits += bool(count)
+                if next_seq not in frames:
+                    chunk = data[next_seq * self.block_size : (next_seq + 1) * self.block_size]
+                    packed = worthwhile(chunk, self.baud) if self._use_compression else None
+                    if packed is not None:
+                        header = f"ZDATA {next_seq} {len(packed)} {len(chunk)} {crc32_hex(chunk)}"
+                        frames[next_seq] = header, packed
+                        self.compressed_blocks += 1
+                    else:
+                        frames[next_seq] = f"DATA {next_seq} {len(chunk)} {crc32_hex(chunk)}", chunk
+                header, payload = frames[next_seq]
+                self.link.send_line_and_raw(header, payload)
+                self.data_wire_bytes += len(header) + 1 + len(payload)
+                next_seq += 1
+            deadline = time.monotonic() + self.ack_timeout
+            while True:
+                try:
+                    reply = self.link.recv_line(max(0, deadline - time.monotonic()))
+                except TimeoutError_:
+                    reply = ""
+                parts = reply.split()
+                if len(parts) == 2 and parts[0] == "ACK" and parts[1].isdecimal():
+                    ack = int(parts[1])
+                    if ack >= next_seq:
+                        raise ProtocolError("ACK for unsent block")
+                    if ack < base:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError_("only duplicate ACKs received")
+                        continue  # duplicate ACK never releases additional credit
+                    base = ack + 1
+                    attempts = {seq: n for seq, n in attempts.items() if seq >= base}
+                    frames = {seq: frame for seq, frame in frames.items() if seq >= base}
+                    recoveries = 0
+                    if self.on_progress:
+                        self.on_progress(min(base * self.block_size, len(data)), len(data))
+                    break
+                if not parts or parts[0] == "NAK":
+                    recoveries += 1
+                    if recoveries > self.max_retries:
+                        raise RetryError("window recovery exhausted retries")
+                    base = self._recover_window(base, next_seq)
+                    attempts = {seq: n for seq, n in attempts.items() if seq >= base}
+                    frames = {seq: frame for seq, frame in frames.items() if seq >= base}
+                    next_seq = base
+                    if self.on_progress:
+                        self.on_progress(min(base * self.block_size, len(data)), len(data))
+                    break
+                if self._old_resume(parts) and time.monotonic() < deadline:
+                    continue
+                raise ProtocolError(f"unexpected window reply: {reply!r}")
+        return retransmits
+
+    def _old_resume(self, parts: list[str]) -> bool:
+        return (len(parts) == 3 and parts[0] == "RESUME" and parts[1].isdecimal()
+                and 0 < int(parts[1]) <= self._barrier_id and parts[2].isdecimal())
+
+    def _recover_window(self, base: int, sent: int) -> int:
+        self._barrier_id += 1
+        token = str(self._barrier_id)
+        for _ in range(self.max_retries + 1):
+            self.link.send_line(f"BARRIER {token}")
+            deadline = time.monotonic() + self.ack_timeout
+            while time.monotonic() < deadline:
+                try:
+                    parts = self.link.recv_line(deadline - time.monotonic()).split()
+                except TimeoutError_:
+                    break
+                if len(parts) == 3 and parts[:2] == ["RESUME", token]:
+                    if not parts[2].isdecimal() or not base <= int(parts[2]) <= sent:
+                        raise ProtocolError("invalid recovery sequence")
+                    return int(parts[2])
+                if parts and parts[0] in {"ACK", "NAK", "RESUME"}:
+                    continue
+                raise ProtocolError(f"unexpected recovery reply: {parts!r}")
+        raise TimeoutError_("recovery barrier was not acknowledged")
 
     def _send_block(self, seq: int, chunk: bytes) -> int:
         """Send one block until ACKed. Returns how many retransmits it took."""
         timeouts = 0
         for attempt in range(self.max_retries + 1):
-            self.link.send_line_and_raw(f"DATA {seq} {len(chunk)} {crc32_hex(chunk)}", chunk)
+            header = f"DATA {seq} {len(chunk)} {crc32_hex(chunk)}"
+            self.link.send_line_and_raw(header, chunk)
+            self.data_wire_bytes += len(header) + 1 + len(chunk)
             try:
                 reply = self.link.recv_line(self.ack_timeout)
             except TimeoutError_ as exc:

@@ -1,6 +1,6 @@
 # PCUTP
 
-**PicoCalc / uConsole UART File Transfer Protocol** — v0.2
+**PicoCalc / uConsole UART File Transfer Protocol** — v2.1
 
 PCUTPは、**インターネット接続機能を持たないデバイスに、UART経由でネットワーク機能を持たせるための軽量プロトコル**です。
 
@@ -23,7 +23,11 @@ PicoCalc
 SDカード
 ```
 
-完全なプロトコル仕様は [`docs/PCUTP-0.2.md`](docs/PCUTP-0.2.md) を参照してください。
+フロー制御・MTU自動選択・LZ4圧縮は [`docs/PCUTP-flow.md`](docs/PCUTP-flow.md)、
+実測結果は [`docs/PCUTP-performance.md`](docs/PCUTP-performance.md) を参照してください。
+ワイヤバージョンは `PCUTP/2` です。
+
+基本転送のプロトコル仕様は [`docs/PCUTP-0.2.md`](docs/PCUTP-0.2.md) を参照してください。
 旧版は [`docs/PCUTP-0.1.md`](docs/PCUTP-0.1.md) に残してあります。
 
 ## このプロジェクトは何ですか？
@@ -265,7 +269,7 @@ PCUTPでは、**制御情報はASCIIテキスト、ファイル本体はRAWバ�
 たとえば制御メッセージは、
 
 ```text
-HELLO PCUTP/1
+HELLO PCUTP/2
 GET TEST.BAS https://example.com/test.bas
 META TEST.BAS 18342 4096 5 8B58A921
 DATA 0 4096 4A91F33C
@@ -363,7 +367,7 @@ TEST.BAS
 
 ## 現在のプロトコル
 
-PCUTP v0.2では、現在以下の制御語を使用します。
+PCUTP/2（実装v2.1）では、以下の制御語を使用します。
 
 ```text
 接続         HELLO     発呼
@@ -376,6 +380,7 @@ PCUTP v0.2では、現在以下の制御語を使用します。
              META      ファイル情報（サイズ・ブロック数・CRC32）
              READY     受信準備完了
              DATA      データブロック（この後にRAWバイナリ）
+             ZDATA     圧縮データブロック（LZ4）
              ACK       ブロック受領
              NAK       ブロック再送要求
              DONE      全ブロック送信完了
@@ -385,9 +390,13 @@ PCUTP v0.2では、現在以下の制御語を使用します。
 維持         PING      生存確認
              PONG      応答
              CLOSE     正常切断
+             BYE       切断確認
+
+回復         BARRIER   先行データの読み切りを要求
+             RESUME    読み切り完了と次のシーケンス番号
 ```
 
-v0.1から追加されたのは `HOWRU` `SYNC` `CONNECT` `FETCHING` `PING` `PONG` `CLOSE` の7語です。
+v0.2でv0.1から追加したのは `HOWRU` `SYNC` `CONNECT` `FETCHING` `PING` `PONG` `CLOSE` の7語です。
 これにより、**1回の接続で複数のファイルを続けてダウンロードできる**ようになり
 （v0.1では1ファイルごとに接続をやり直していました）、
 回線が切れたことを検出できるようになりました。
@@ -409,7 +418,9 @@ No flow control
 
 つまり **115200 8N1** です。
 
-標準ブロックサイズは **4096 bytes** です。
+ブロック上限は **4096 bytes** です。既定ではファイル長・受信側上限・圧縮可能性から
+MTUを自動選択し、対応する相手には最大2ブロックを先行送信します。
+`--block 4096` で固定、`--window 1` で先行送信を停止、`--no-compression` で圧縮を停止できます。
 
 ## アーキテクチャ
 
@@ -508,7 +519,8 @@ PYTHONPATH=src python3 -m pcutp.daemon ports    # 候補を一覧表示
 PYTHONPATH=src python3 -u -m pcutp.daemon serve --trace --sound
 ```
 
-`--trace` `--quiet` `--block` はサブコマンドの前後どちらに書いても構いません。音の一覧は `pcutp.daemon sounds` で名前付きで再生できます。
+`--trace` `--quiet` `--block` はサブコマンドの前後どちらに書いても構いません。音の一覧は `pcutp.daemon sounds`、全22制御語だけなら
+`pcutp.daemon sounds --words-only` で名前付きで再生できます。
 
 PicoCalc側（ランチャーがカレントを `B:/pico1-apps` にするため、フルパスで指定します）：
 

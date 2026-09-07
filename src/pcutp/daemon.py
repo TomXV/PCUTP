@@ -114,6 +114,8 @@ def run_serial(args: argparse.Namespace) -> int:
     server = PcutpServer(
         link,
         block_size=args.block,
+        window_size=args.window,
+        compression=not args.no_compression,
         max_file_size=args.max_size,
         baud=args.baud,
         keepalive_interval=args.keepalive_interval,
@@ -210,6 +212,11 @@ def run_sounds(args: argparse.Namespace) -> int:
         print(f"  {word:<6} {hz:>4} Hz  {length}")
         sound.line(word)
         time.sleep(0.55)
+    if args.words_only:
+        ok = sound.active
+        print(f"audio underruns: {sound.underruns}")
+        sound.close()
+        return 0 if ok else 1
     print("\nthe internet leg (swept and noisy)")
     for name, label in (
         ("dial", "request going out"),
@@ -246,6 +253,18 @@ def run_sounds(args: argparse.Namespace) -> int:
     return 0
 
 
+def _block_size(value: str) -> int | None:
+    if value == "auto":
+        return None
+    try:
+        size = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("block must be auto or 1..4096") from exc
+    if not 1 <= size <= const.MAX_BLOCK_SIZE:
+        raise argparse.ArgumentTypeError("block must be auto or 1..4096")
+    return size
+
+
 def _shared(*, suppress: bool) -> argparse.ArgumentParser:
     """Flags that read naturally on either side of the subcommand.
 
@@ -261,9 +280,9 @@ def _shared(*, suppress: bool) -> argparse.ArgumentParser:
     p.add_argument("--quiet", action="store_true", default=off, help="no progress bar")
     p.add_argument(
         "--block",
-        type=int,
-        default=argparse.SUPPRESS if suppress else const.DEFAULT_BLOCK_SIZE,
-        help="block size in bytes",
+        type=_block_size,
+        default=argparse.SUPPRESS if suppress else None,
+        help="block size in bytes, or auto (default: measured PicoCalc cost model)",
     )
     return p
 
@@ -291,6 +310,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="rate the handshake runs on, and the fallback when a faster one fails",
     )
     serve.add_argument("--max-size", type=int, default=const.MAX_FILE_SIZE)
+    serve.add_argument("--no-compression", action="store_true", help="send raw blocks only")
+    serve.add_argument(
+        "--window", type=int, choices=(1, 2), default=2,
+        help="maximum unacknowledged blocks (limited by receiver capabilities)",
+    )
     serve.add_argument("--idle-timeout", type=float, default=3600.0)
     serve.add_argument(
         "--keepalive-interval", type=float, default=const.KEEPALIVE_INTERVAL,
@@ -314,6 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
     test.set_defaults(func=run_selftest)
 
     tones = sub.add_parser("sounds", help="play and name every sound")
+    tones.add_argument("--words-only", action="store_true", help="play just the 22 control words")
     tones.set_defaults(func=run_sounds)
 
     ports = sub.add_parser("ports", help="list serial ports that could be the PicoCalc")

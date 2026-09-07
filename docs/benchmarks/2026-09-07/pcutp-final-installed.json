@@ -1,0 +1,28 @@
+[
+  {
+    "block": 4096,
+    "requested_block": null,
+    "window": 2,
+    "iteration": 0,
+    "size": 32768,
+    "seconds": 1.5308288329979405,
+    "kib_s": 20.90370870356023,
+    "request_seconds": 1.5381604499998502,
+    "retransmits": 0,
+    "crc32": "751F3E92",
+    "verified": true,
+    "program": "B:/PCUTP.BAS",
+    "corrupt_seq": -1,
+    "drop_ack": -1,
+    "barriers": 0,
+    "negotiated_window": 2,
+    "compression": "auto",
+    "compressed_blocks": 8,
+    "data_wire_bytes": 3328,
+    "fixture": "generated",
+    "sound": true,
+    "audio_events": 19,
+    "audio_max_render_delay_ms": 9.033987007569522,
+    "audio_underruns": 0
+  }
+]

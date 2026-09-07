@@ -1,0 +1,24 @@
+[
+  {
+    "block": 4096,
+    "requested_block": null,
+    "window": 2,
+    "iteration": 0,
+    "size": 1048576,
+    "seconds": 94.01240037700336,
+    "kib_s": 10.892180136807607,
+    "retransmits": 0,
+    "crc32": "DBDA0728",
+    "verified": true,
+    "program": "B:/PCFAST.BAS",
+    "corrupt_seq": -1,
+    "drop_ack": -1,
+    "barriers": 0,
+    "negotiated_window": 2,
+    "compression": "off",
+    "compressed_blocks": 0,
+    "data_wire_bytes": 1054354,
+    "fixture": "generated",
+    "sound": true
+  }
+]

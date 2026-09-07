@@ -86,6 +86,7 @@ class Link:
                 del self._buf[: idx + 1]
                 text = line.decode("ascii", errors="replace").strip("\r")
                 if text in ("PING", "PONG"):
+                    self.sound.line(text)
                     if text == "PING":
                         self.send_line("PONG")
                     last_rx = time.monotonic()

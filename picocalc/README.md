@@ -13,7 +13,7 @@ launcher leaves the working directory at `B:/pico1-apps`, not `B:/`:
 ```
 
 Wiring: PicoCalc's "Core GPIOs" header, GP4 (TX) / GP5 (RX), to the
-uConsole UART, common ground, 460800 8N1. Use *Core GPIOs*, not the
+uConsole UART, common ground, 115200 8N1. Use *Core GPIOs*, not the
 identically-labelled UART1_RX/UART1_TX pins on the "Mainboard GPIOs"
 header - those tested dead on this unit even with a direct on-board
 loopback (no external wiring), and are suspected to be routed to the
@@ -26,3 +26,9 @@ pins and `OPTION SERIAL CONSOLE` never needs touching.
 The BASIC side is not exercised by CI (no interpreter in the image). The
 authoritative behaviour is the Python receiver in `src/pcutp/client.py`, which
 implements the same state machine and is covered by the protocol tests.
+
+The FLOW=1 extension advertises a 16384-byte UART receive buffer and a two-block
+window. Optional LZ4 blocks use a separate 4096-byte decode buffer. The sender
+selects each file's MTU up to the advertised 4096-byte limit. See
+[flow and compression](../docs/PCUTP-flow.md) and
+[hardware measurements](../docs/PCUTP-performance.md).

@@ -6,9 +6,9 @@ each other rather than one doubled voice.
 
 Tones are synthesised as raw PCM and pushed down a single long-lived `aplay`
 pipe: a subprocess per blip would be hundreds of spawns on a large transfer.
-Playback runs on its own thread behind a small queue that *drops* when full,
-because a transfer must never wait on audio - the receiving end overruns its
-UART buffer if either side stops servicing the link to make a noise.
+Playback follows the latest event in paced 10 ms chunks with continuous phase
+and a short crossfade. There is no FIFO of obsolete effects; neither the audio
+device nor a long fanfare can hold up the protocol thread.
 
 Timbre divides the conversation into layers by ear: control words are clean
 sine blips, the per-block DATA/ACK pair is a softer triangle, errors are a
@@ -16,13 +16,18 @@ harsh square, and everything on the internet leg stays swept or noisy.
 """
 
 import math
-import queue
+import os
 import struct
 import subprocess
 import threading
+import time
 
 RATE = 22050
 VOLUME = 0.3
+CHUNK_FRAMES = 220
+CHUNK_SECONDS = CHUNK_FRAMES / RATE
+SILENCE = bytes(CHUNK_FRAMES * 2)
+FADE_FRAMES = 110  # 5 ms crossfade when the newest event preempts an old effect
 
 # Same pitches as picocalc/PCUTP.BAS, an octave down. Keyed by the first word
 # of the control line, so both directions are covered by one table.
@@ -33,6 +38,10 @@ PITCH = {
     "META": 330,
     "READY": 349,
     "DATA": 392,
+    "ZDATA": 415,
+    "BARRIER": 196,
+    "RESUME": 554,
+    "BYE": 131,
     "ACK": 440,
     "NAK": 147,
     "DONE": 494,
@@ -43,20 +52,21 @@ PITCH = {
     "HOWRU": 587,
     "SYNC": 466,
     "CONNECT": 659,
+    "PING": 740,
+    "PONG": 831,
 }
-# PING and PONG are deliberately absent: they fire every keep-alive
-# interval, and voicing each one would be a constant beep on an idle link.
+# Keep-alive words are audible too, so the entire wire vocabulary is covered.
 
 WORD_MS = 45
 BLIP_MS = 12
 # DATA and ACK fire once per block, so they stay short; SYNC is a single
 # confirmation blip mid-handshake.
-SHORT = {"DATA", "ACK", "SYNC"}
+SHORT = {"DATA", "ZDATA", "ACK", "SYNC", "PING", "PONG"}
 
 # Timbre by category. Errors are a square wave so they cut through; the
 # per-block pair is a triangle, softer across sixteen or more repeats.
 SQUARE = {"ERR", "NAK", "FAIL"}
-TRIANGLE = {"DATA", "ACK"}
+TRIANGLE = {"DATA", "ZDATA", "ACK"}
 # A hair under a semitone. The DATA/ACK pair alternates two close pitches so
 # a long run of identical blips does not drone, without sounding out of tune.
 DETUNE = 1.03
@@ -199,8 +209,18 @@ class Sound:
 
     def __init__(self, enabled: bool = False):
         self.enabled = enabled
-        self._q: queue.Queue[bytes] | None = None
         self._proc: subprocess.Popen | None = None
+        self._event: tuple[float, bytes] | None = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._monitor_thread: threading.Thread | None = None
+        self.underruns = 0
+        self._last_rendered: tuple[float, bytes] | None = None
+        self._current_pcm = b""
+        self._position = 0
+        self.rendered_events = 0
+        self.max_render_delay_ms = 0.0
         self._pcm: dict[str, bytes] = {}
         self._alt: dict[str, tuple[bytes, bytes]] = {}
         self._blip = 0
@@ -212,14 +232,20 @@ class Sound:
     def _start(self) -> None:
         try:
             self._proc = subprocess.Popen(
-                ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", str(RATE), "-c", "1", "-"],
+                ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", str(RATE),
+                 "-c", "1", "--buffer-time=60000", "--period-time=10000",
+                 "--start-delay=30000", "-"],
                 stdin=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                env={**os.environ, "PULSE_LATENCY_MSEC": "40"},
             )
         except (OSError, ValueError):
             # No aplay, no sound - never a reason to fail a transfer.
             self.enabled = False
             return
+        self._monitor_thread = threading.Thread(target=self._monitor, daemon=True)
+        self._monitor_thread.start()
         # Render every word once, up front. Synthesising on the calling
         # thread instead cost ~16ms per block - 51.1s against 48.1s over
         # 191 blocks - because the protocol thread was doing the DSP.
@@ -235,7 +261,7 @@ class Sound:
         # Two close pitches for the per-block pair, alternated in `line`.
         self._alt = {
             word: (_triangle(hz, BLIP_MS), _triangle(int(hz * DETUNE), BLIP_MS))
-            for word, hz in (("DATA", PITCH["DATA"]), ("ACK", PITCH["ACK"]))
+            for word, hz in ((word, PITCH[word]) for word in ("DATA", "ZDATA", "ACK"))
         }
         self._net = {
             "dial": _sweep(300, 1400, 260),      # request heading out
@@ -253,24 +279,62 @@ class Sound:
             "disconnect": _sweep(1600, 200, 320), # graceful hangup, on CLOSE
             "fanfare": _fanfare(),                # verified transfer
         }
-        self._q = queue.Queue(maxsize=4)
-        threading.Thread(target=self._pump, daemon=True).start()
+        os.set_blocking(self._proc.stdin.fileno(), False)
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
 
     def _pump(self) -> None:
-        while True:
-            pcm = self._q.get()
-            if pcm is None:
-                break
+        deadline = time.monotonic()
+        while not self._stop.is_set():
+            now = time.monotonic()
+            pcm = self._render(now)
             try:
-                self._proc.stdin.write(pcm)
-                self._proc.stdin.flush()
-            except (BrokenPipeError, ValueError, AttributeError):
+                os.write(self._proc.stdin.fileno(), pcm)
+            except BlockingIOError:
+                pass  # device stalled: drop this time slice, never queue it
+            except (OSError, ValueError, AttributeError):
                 break
+            # Do not fill the pipe with seconds of future audio. If the worker
+            # was delayed, skip missed time slices rather than catching up.
+            deadline = max(deadline + CHUNK_SECONDS, time.monotonic())
+            self._stop.wait(max(0, deadline - time.monotonic()))
+
+    def _monitor(self) -> None:
+        for line in self._proc.stderr:
+            if b"underrun" in line.lower():
+                self.underruns += 1
+
+    def _render(self, now: float) -> bytes:
+        with self._lock:
+            event = self._event
+        if event is None:
+            return SILENCE
+        when, pcm = event
+        fading = None
+        if event is not self._last_rendered:
+            self._last_rendered = event
+            self.rendered_events += 1
+            self.max_render_delay_ms = max(self.max_render_delay_ms, (now - when) * 1000)
+            fading = self._current_pcm[self._position:self._position + FADE_FRAMES * 2]
+            self._current_pcm = pcm if now - when < len(pcm) / (RATE * 2) else b""
+            self._position = 0
+        # Advance by samples, not rounded wall-clock offsets: scheduler jitter
+        # must not skip/repeat waveform samples and create phase discontinuities.
+        chunk = self._current_pcm[self._position:self._position + len(SILENCE)]
+        self._position += len(SILENCE)
+        chunk = chunk.ljust(len(SILENCE), b"\0")
+        if fading is not None:
+            old = struct.unpack(f"<{FADE_FRAMES}h", fading.ljust(FADE_FRAMES * 2, b"\0"))
+            new = struct.unpack(f"<{CHUNK_FRAMES}h", chunk)
+            mixed = [int((a * (FADE_FRAMES - i) + new[i] * i) / FADE_FRAMES)
+                     for i, a in enumerate(old)]
+            chunk = struct.pack(f"<{CHUNK_FRAMES}h", *mixed, *new[FADE_FRAMES:])
+        return chunk
 
     def line(self, text: str) -> None:
         """Voice a control line, keyed off its first word. A dict lookup and a
-        queue push - no synthesis, nothing that can block the caller."""
-        if not self.enabled or self._q is None:
+        timestamp replacement - no synthesis or waiting for playback."""
+        if not self.enabled:
             return
         word = text.split(" ", 1)[0] if text else ""
         alt = self._alt.get(word)
@@ -279,6 +343,11 @@ class Sound:
             self._blip += 1
             return
         self._push(self._pcm.get(word))
+
+    @property
+    def active(self) -> bool:
+        """Whether the audio player is still running (not acoustic confirmation)."""
+        return self.enabled and self._proc is not None and self._proc.poll() is None
 
     # -- the handshake leg --------------------------------------------------
     def dial(self) -> None:
@@ -332,22 +401,27 @@ class Sound:
         self._push(self._net.get("err:" + type(exc).__name__, self._net["hangup"]))
 
     def _push(self, pcm: "bytes | None") -> None:
-        if not self.enabled or self._q is None or pcm is None:
+        if not self.enabled or pcm is None:
             return
-        try:
-            self._q.put_nowait(pcm)
-        except queue.Full:
-            pass  # behind on audio; the transfer matters more
+        with self._lock:
+            self._event = (time.monotonic(), pcm)
 
     def close(self) -> None:
         if self._proc is None:
             return
-        try:
-            self._q.put_nowait(None)
-        except (queue.Full, AttributeError):
-            pass
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(0.5)
         try:
             self._proc.stdin.close()
         except (OSError, ValueError):
             pass
+        try:
+            self._proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            self._proc.terminate()
+            self._proc.wait(timeout=1)
+        if self._monitor_thread is not None:
+            self._monitor_thread.join(0.2)
+        self._proc.stderr.close()
         self._proc = None
