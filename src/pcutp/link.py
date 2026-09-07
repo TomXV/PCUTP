@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from . import const
 from .const import LF
 from .errors import LinkLostError, ProtocolError, TimeoutError_
 from .sound import Sound
@@ -109,6 +110,77 @@ class Link:
             if chunk:
                 self._buf.extend(chunk)
                 last_rx = time.monotonic()
+
+    # -- teardown (section 7 of docs/PCUTP-session.md) --------------------
+    # CLOSE is FIN and BYE is FIN-ACK. Each direction closes on its own, so
+    # "I have nothing more to send" and "the session is over" stop being the
+    # same statement - which is what lets a sender stop taking requests while
+    # it finishes the file it is already sending.
+
+    def send_fin(
+        self,
+        timeout: float = const.CLOSE_TIMEOUT,
+        retries: int = const.CLOSE_RETRIES,
+    ) -> bool:
+        """Close this direction: send CLOSE until BYE comes back.
+
+        Returns whether it was acknowledged. A CLOSE arriving while waiting is
+        the peer closing its own direction at the same moment; answering it and
+        carrying on is all a simultaneous close needs, because BYE is idempotent
+        and there is no state that distinguishes who spoke first.
+        """
+        for _ in range(retries):
+            self.send_line("CLOSE")
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    line = self.recv_line(remaining)
+                except (TimeoutError_, ProtocolError):
+                    break
+                if line == "BYE":
+                    return True
+                if line == "CLOSE":
+                    self.send_line("BYE")
+        return False
+
+    def await_fin(self, timeout: float = const.CLOSE_TIMEOUT) -> bool:
+        """Wait for the peer to close its direction, and acknowledge it."""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                line = self.recv_line(remaining)
+            except (TimeoutError_, ProtocolError):
+                return False
+            if line == "CLOSE":
+                self.send_line("BYE")
+                return True
+
+    def linger(self, seconds: float = const.LINGER_TIME) -> None:
+        """Watch the line after the last BYE, re-answering a repeated CLOSE.
+
+        Without this, a lost BYE makes the peer resend CLOSE into a line this
+        end has already declared idle, and that stray CLOSE is then read as the
+        first control line of whatever session comes next. TCP calls the same
+        idea TIME_WAIT; here it belongs at both ends rather than only the one
+        that closed first, because a single wire is read by both of them.
+        """
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                line = self.recv_line(remaining)
+            except (TimeoutError_, ProtocolError):
+                return
+            if line == "CLOSE":
+                self.send_line("BYE")
 
     def recv_exact(self, size: int, timeout: float) -> bytes:
         deadline = time.monotonic() + timeout

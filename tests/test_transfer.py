@@ -191,7 +191,7 @@ def test_three_way_handshake_client_sends_sync_after_howru(tmp_path):
     maxblk = client.hello()
     thread.join(5)
 
-    assert seen["hello"] == "HELLO PCUTP/1"
+    assert seen["hello"] == "HELLO PCUTP/2"
     # SYNC is the client's ACK of the howru tone; rate negotiation is gone, so
     # it is a bare SYNC with no RATES= payload.
     assert seen["sync"] == "SYNC"
@@ -213,7 +213,7 @@ def test_three_way_handshake_server_rejects_non_sync_ack(tmp_path):
     thread = run_server(server, results)
     client_link = Link(pipe.right)
 
-    client_link.send_line("HELLO PCUTP/1")
+    client_link.send_line("HELLO PCUTP/2")
     assert client_link.recv_line(5.0) == "HOWRU"
     client_link.send_line("NOTSYNC")
     assert client_link.recv_line(5.0) == "ERR PROTOCOL"
@@ -268,7 +268,7 @@ def test_rehello_during_session_rehandshakes(tmp_path):
     client.hello()
     # Peer restarts: a second HELLO mid-session must re-run the handshake,
     # not come back as ERR PROTOCOL.
-    client.link.send_line("HELLO PCUTP/1")
+    client.link.send_line("HELLO PCUTP/2")
     assert client.link.recv_line(5.0) == "HOWRU"
     client.link.send_line("SYNC")
     assert client.link.recv_line(5.0).startswith("CONNECT ")

@@ -83,7 +83,13 @@ class PcutpServer:
             else:
                 request = self.link.recv_line(timeout, keepalive=self.keepalive)
             if request == "CLOSE":
+                # The peer has stopped sending requests. Acknowledge that half,
+                # then close this one: nothing is in flight here, because a GET
+                # runs to completion before the next request is read.
+                self.link.send_line("BYE")
                 self.link.sound.disconnect()
+                self.link.send_fin()
+                self.link.linger()
                 self.link.log("session closed by peer")
                 return
             if request.startswith("HELLO "):
@@ -95,6 +101,21 @@ class PcutpServer:
             result = self._handle_get(request)
             if result is not None and self.on_result is not None:
                 self.on_result(result)
+
+    def shutdown(self) -> None:
+        """Close this side of the session, in whatever state it is in.
+
+        Used when the daemon is asked to stop. Sending CLOSE rather than just
+        dropping the port is the difference between the receiver printing
+        "Disconnected" and it printing "Link lost" ten seconds later: a clean
+        shutdown should not be reported as a fault.
+        """
+        try:
+            self.link.send_fin()
+            self.link.await_fin()
+            self.link.linger()
+        except PcutpError:
+            pass  # the peer is already gone; there is nothing to be polite to
 
     def _handle_hello(self, line: str) -> bool:
         parts = line.split()

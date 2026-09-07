@@ -1,6 +1,6 @@
 """Protocol constants for PCUTP v0.2 (see docs/PCUTP-0.2.md)."""
 
-PROTOCOL_VERSION = "PCUTP/1"
+PROTOCOL_VERSION = "PCUTP/2"
 
 # The one line rate for the whole link. Negotiation was a feature of v0.2 that
 # was removed after hardware testing: the Flipper USB-UART bridge carried
@@ -20,6 +20,16 @@ ACK_TIMEOUT = 5.0        # seconds, section 16
 MAX_TIMEOUTS = 5         # section 16
 LINE_TIMEOUT = 30.0      # generic control-line read timeout
 DATA_TIMEOUT = 10.0      # PicoCalc side: raw payload after a DATA header
+
+# Teardown (section 7 of docs/PCUTP-session.md). CLOSE is FIN, BYE is FIN-ACK,
+# and each direction closes independently.
+CLOSE_TIMEOUT = 3.0      # wait for BYE before resending CLOSE
+CLOSE_RETRIES = 3        # attempts before giving up and dropping the link
+# After the last BYE, keep watching the line. A BYE can be lost, in which case
+# the peer resends CLOSE; if this end had already gone idle that stray CLOSE
+# would arrive as the *next* session's first control line. The longest thing
+# that can still be in flight is one block, 0.36s at 115200, so this is ample.
+LINGER_TIME = 2.0
 
 KEEPALIVE_INTERVAL = 5.0   # idle seconds before sending a PING probe
 KEEPALIVE_TIMEOUT = 10.0   # silent seconds before declaring the link lost

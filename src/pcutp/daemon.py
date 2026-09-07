@@ -135,7 +135,17 @@ def run_serial(args: argparse.Namespace) -> int:
                 link.discard_input()
                 continue
     except KeyboardInterrupt:
-        print("\nstopped")
+        # Say goodbye rather than just vanishing. Dropping the port leaves the
+        # receiver to discover the silence as a keep-alive failure ten seconds
+        # later and report a clean shutdown as "Link lost"; a CLOSE turns that
+        # into "Disconnected". Interrupting again skips it, for the case where
+        # the peer is already gone and the wait is just a wait.
+        print("\nclosing the session (Ctrl-C again to drop it)")
+        try:
+            server.shutdown()
+        except KeyboardInterrupt:
+            pass
+        print("stopped")
         return 0
     finally:
         sound.close()

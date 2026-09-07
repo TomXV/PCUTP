@@ -19,9 +19,12 @@
 Option Explicit
 Option Default Integer
 
-Const VER$      = "PCUTP/1"
+Const VER$      = "PCUTP/2"
 Const BLKMAX    = 4096
 Const ACKTMO    = 5000        ' ms, section 16
+Const CLSTMO    = 3000        ' ms to wait for BYE before resending CLOSE
+Const CLSRTY    = 3           ' CLOSE attempts before dropping the link
+Const LINGERMS  = 2000        ' ms to keep answering a repeated CLOSE
 Const DATTMO    = 10000       ' ms, raw payload after a DATA header
 Const HSTMO     = 10000       ' ms, dial-up handshake wait (HOWRU / CONNECT)
 ' Single fixed line rate. Rate negotiation was removed after hardware testing:
@@ -63,6 +66,7 @@ Const HZ_TX_NAK   = 294       ' -> NAK
 Const HZ_TX_OK    = 1760      ' -> OK
 Const HZ_TX_FAIL  = 220       ' -> FAIL / ERR
 Const HZ_CLOSE    = 196       ' -> CLOSE (graceful hangup, low falling note)
+Const HZ_BYE      = 262       ' <- BYE   (the close is acknowledged)
 
 ' Dial-up feel: a dial tone as HELLO goes out, an answer/carrier tone when
 ' HOWRU arrives, a short flourish when the CONNECT line brings the carrier up.
@@ -89,6 +93,7 @@ Dim crcBlockOut, crcRunningOut
 Dim ws$
 Dim lastRx, maxblk            ' keep-alive liveness + negotiated block size
 Dim kaWin                     ' current link-loss window, ms (KATMO or FETTMO)
+Dim peerDone                  ' the uConsole has closed its half of the session
 
 BuildReflect                  ' must run after rtab%() is dimensioned
 
@@ -107,7 +112,7 @@ Open "COM2:" + Str$(BASEBAUD) As #1
 lastRx = Timer
 kaWin = KATMO
 
-Print "PCUTP 0.2"
+Print "PCUTP v2"
 
 ' ---- dial-up handshake -----------------------------------------------
 ' Ring out: send HELLO, expect the bare answer tone HOWRU, then confirm with
@@ -151,7 +156,7 @@ Print "MAXBLK=" + Str$(maxblk)
 Do
   Do
     url$ = InputAlive$("URL: ")
-    If url$ = "" Then Tone1 HZ_CLOSE, MS_WORD: Print #1, "CLOSE": Pause 200: Print "Disconnected": End
+    If url$ = "" Then CloseSession : End
     If Not ValidUrl(url$) Then Print "Invalid URL - retype (Backspace only)."
   Loop Until ValidUrl(url$)
 
@@ -204,6 +209,10 @@ Do
   Do While seq < blocks
     s$ = RecvLine$(2 * ACKTMO)
     If Left$(s$, 3) = "ERR" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Close #2: Print s$: End
+    ' The uConsole half-closing: no more files after this one, but this one
+    ' still finishes. Refusing here would throw away a transfer that is about
+    ' to complete perfectly well.
+    If s$ = "CLOSE" Then Print #1, "BYE" : Tone1 HZ_BYE, MS_WORD : peerDone = 1 : Continue Do
     Split s$, meta$()                     ' DATA seq len crc
     If meta$(0) <> "DATA" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Close #2: Print "protocol error": End
     Tone1 HZ_RX_DATA, MS_BLIP
@@ -282,6 +291,53 @@ Do
   Print "Saved:"
   Print fn$
 Loop
+
+' ---- teardown (section 7 of docs/PCUTP-session.md) -------------------
+' CLOSE is FIN and BYE is FIN-ACK, and each direction closes on its own.
+' v1 sent one unacknowledged CLOSE and hung up, which left this end with no
+' evidence the uConsole had heard it: a CLOSE that went missing stranded the
+' uConsole until its idle timeout - an hour by default - still holding the port.
+Sub CloseSession
+  Local k, t0
+  Tone1 HZ_CLOSE, MS_WORD
+  ' Close this direction. A CLOSE arriving while waiting is the uConsole
+  ' closing its own at the same moment; answering it and carrying on is all a
+  ' simultaneous close needs, because BYE is idempotent.
+  For k = 1 To CLSRTY
+    Print #1, "CLOSE"
+    s$ = RecvLine$(CLSTMO)
+    If s$ = "BYE" Then Tone1 HZ_BYE, MS_WORD : Exit For
+    If s$ = "CLOSE" Then Print #1, "BYE" : peerDone = 1
+  Next k
+
+  ' Then wait for the uConsole to close its own direction, unless it already
+  ' has - it may have gone first, at the prompt or mid-file.
+  If Not peerDone Then
+    t0 = Timer
+    Do While Timer - t0 < CLSTMO
+      s$ = RecvLine$(CLSTMO)
+      If s$ = "" Then Exit Do
+      If s$ = "CLOSE" Then Print #1, "BYE" : Tone1 HZ_BYE, MS_WORD : Exit Do
+    Loop
+  EndIf
+
+  Linger
+  Print "Disconnected"
+End Sub
+
+' Keep watching the line after the last BYE. A BYE can be lost, in which case
+' the uConsole resends CLOSE; if this end had already gone quiet that stray
+' CLOSE would be read as the first control line of the next session. TCP calls
+' the same idea TIME_WAIT - here it belongs at both ends, because one wire is
+' read by both of them.
+Sub Linger
+  Local t0
+  t0 = Timer
+  Do While Timer - t0 < LINGERMS
+    s$ = RecvLine$(LINGERMS)
+    If s$ = "CLOSE" Then Print #1, "BYE"
+  Loop
+End Sub
 
 ' ---- helpers ---------------------------------------------------------
 ' RecvLine$  : read one LF-terminated control line, or "" on timeout
@@ -390,6 +446,10 @@ Function InputAlive$(prompt$)
       ch$ = Input$(1, #1)
       If ch$ = Chr$(10) Then
         If u$ = "PING" Then Print #1, "PONG"
+        ' The uConsole is shutting down. Answering and quitting the prompt is
+        ' what turns a clean shutdown into "Disconnected" instead of the
+        ' keep-alive timer reporting it as "Link lost" ten seconds later.
+        If u$ = "CLOSE" Then Print #1, "BYE" : peerDone = 1 : InputAlive$ = "" : Exit Function
         u$ = ""
       ElseIf ch$ <> Chr$(13) Then
         If Len(u$) < 250 Then u$ = u$ + ch$ Else u$ = ""

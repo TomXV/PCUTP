@@ -44,6 +44,9 @@ class PcutpClient:
         self.dest_dir = Path(dest_dir)
         self.free_space = free_space
         self.on_progress = on_progress
+        # Set when the sender closes its direction: it will finish the file it
+        # is sending and then stop, so no further GET should be issued.
+        self.peer_closing = False
 
     def hello(self, timeout: float = const.HANDSHAKE_TIMEOUT) -> int:
         """Dial in: expect HOWRU (answer tone) then CONNECT (carrier up).
@@ -73,8 +76,17 @@ class PcutpClient:
         return self._receive(meta)
 
     def close(self) -> None:
-        """Hang up cleanly: send CLOSE so the sender returns to IDLE."""
-        self.link.send_line("CLOSE")
+        """Hang up: CLOSE, wait for BYE, answer the sender's CLOSE, then linger.
+
+        Four lines rather than one. The single unacknowledged CLOSE of v1 left
+        this end with no evidence the sender heard it, so a CLOSE that went
+        missing stranded the sender until its idle timeout - an hour, by
+        default - still holding the port.
+        """
+        if self.link.send_fin():
+            # Acknowledged. The sender closes its own direction next.
+            self.link.await_fin()
+        self.link.linger()
 
     # -- internals -------------------------------------------------------
     @staticmethod
@@ -120,6 +132,14 @@ class PcutpClient:
             while expected < meta.blocks:
                 header = self.link.recv_line(const.ACK_TIMEOUT * 2)
                 self._raise_for_err(header)
+                if header == "CLOSE":
+                    # The sender is half-closing: no more files after this one,
+                    # but this one still finishes. Acknowledge and keep reading -
+                    # refusing here would throw away a transfer that is about to
+                    # complete perfectly well.
+                    self.link.send_line("BYE")
+                    self.peer_closing = True
+                    continue
                 parts = header.split()
                 if len(parts) != 4 or parts[0] != "DATA":
                     raise ProtocolError(f"expected DATA, got {header!r}")
