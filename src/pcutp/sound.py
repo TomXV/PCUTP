@@ -33,6 +33,8 @@ FADE_FRAMES = 110  # 5 ms crossfade when the newest event preempts an old effect
 # of the control line, so both directions are covered by one table.
 PITCH = {
     "HELLO": 262,
+    "HELLO?": 277,
+    "OHRU": 370,
     "GET": 294,
     "FETCHING": 311,
     "META": 330,
@@ -41,6 +43,10 @@ PITCH = {
     "ZDATA": 415,
     "BARRIER": 196,
     "RESUME": 554,
+    "DROP": 185,
+    "RST": 123,
+    "AYT?": 698,
+    "HERE": 880,
     "BYE": 131,
     "ACK": 440,
     "NAK": 147,
@@ -49,9 +55,7 @@ PITCH = {
     "FAIL": 110,
     "ERR": 98,
     "CLOSE": 82,
-    "HOWRU": 587,
-    "SYNC": 466,
-    "CONNECT": 659,
+    "HRU": 466,
     "PING": 740,
     "PONG": 831,
 }
@@ -61,7 +65,7 @@ WORD_MS = 45
 BLIP_MS = 12
 # DATA and ACK fire once per block, so they stay short; SYNC is a single
 # confirmation blip mid-handshake.
-SHORT = {"DATA", "ZDATA", "ACK", "SYNC", "PING", "PONG"}
+SHORT = {"DATA", "ZDATA", "ACK", "HRU", "PING", "PONG"}
 
 # Timbre by category. Errors are a square wave so they cut through; the
 # per-block pair is a triangle, softer across sixteen or more repeats.

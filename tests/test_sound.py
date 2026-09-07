@@ -46,9 +46,9 @@ def test_scheduling_jitter_does_not_break_waveform_phase(monkeypatch):
 
 def test_every_current_control_word_has_a_distinct_pitch():
     words = {
-        "HELLO", "HOWRU", "SYNC", "CONNECT", "GET", "FETCHING", "META", "READY",
+        "HELLO", "HELLO?", "OHRU", "HRU", "GET", "FETCHING", "META", "READY",
         "DATA", "ZDATA", "ACK", "NAK", "DONE", "OK", "FAIL", "ERR", "PING", "PONG",
-        "CLOSE", "BYE", "BARRIER", "RESUME",
+        "CLOSE", "BYE", "BARRIER", "RESUME", "DROP", "RST", "AYT?", "HERE",
     }
     assert set(PITCH) == words
     assert len(set(PITCH.values())) == len(words)

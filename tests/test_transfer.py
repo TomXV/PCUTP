@@ -171,7 +171,7 @@ def test_handshake_returns_maxblk_after_howru_and_connect(tmp_path):
     assert results == []  # no transfer, just the handshake
 
 
-def test_three_way_handshake_client_sends_sync_after_howru(tmp_path):
+def test_three_way_handshake_client_sends_hru_after_proposal(tmp_path):
     pipe = PipePair()
     pipe.left.read_timeout = pipe.right.read_timeout = 0.01
     client = PcutpClient(Link(pipe.right), dest_dir=tmp_path)
@@ -181,9 +181,8 @@ def test_three_way_handshake_client_sends_sync_after_howru(tmp_path):
 
     def server_side():
         seen["hello"] = server_link.recv_line(5.0)
-        server_link.send_line("HOWRU")
-        seen["sync"] = server_link.recv_line(5.0)
-        server_link.send_line("CONNECT 460800 MAXBLK=512")
+        server_link.send_line("HELLO PCUTP/2 HRU? BAUD=115200 MAXBLK=512")
+        seen["hru"] = server_link.recv_line(5.0)
 
     thread = threading.Thread(target=server_side)
     thread.start()
@@ -191,14 +190,13 @@ def test_three_way_handshake_client_sends_sync_after_howru(tmp_path):
     maxblk = client.hello()
     thread.join(5)
 
-    assert seen["hello"] == "HELLO PCUTP/2"
-    # Capabilities accompany SYNC; an old sender can ignore them safely.
-    assert seen["sync"] == "SYNC FLOW=1 MAXBLK=4096 WINDOW=2 RXBUF=16384 LZ4=1"
+    assert seen["hello"] == "HELLO PCUTP/2 FLOW=1 MAXBLK=4096 WINDOW=2 RXBUF=16384 LZ4=1"
+    assert seen["hru"] == "HRU"
     assert client.window_size == 1  # old CONNECT did not opt into FLOW
     assert maxblk == 512
 
 
-def test_server_repeats_howru_for_duplicate_hello():
+def test_server_repeats_proposal_for_duplicate_hello():
     pipe = PipePair()
     pipe.left.read_timeout = pipe.right.read_timeout = 0.01
     server = PcutpServer(Link(pipe.left), connect_delay=0.0)
@@ -210,18 +208,18 @@ def test_server_repeats_howru_for_duplicate_hello():
 
     thread = threading.Thread(target=server_side)
     thread.start()
-    peer.send_line("HELLO PCUTP/2")
-    assert peer.recv_line(5.0) == "HOWRU"
-    peer.send_line("HELLO PCUTP/2")
-    assert peer.recv_line(5.0) == "HOWRU"
-    peer.send_line("SYNC FLOW=1 MAXBLK=4096 WINDOW=1 RXBUF=16384")
-    assert peer.recv_line(5.0).startswith("CONNECT ")
+    hello = "HELLO PCUTP/2 FLOW=1 MAXBLK=4096 WINDOW=1 RXBUF=16384"
+    peer.send_line(hello)
+    assert peer.recv_line(5.0).startswith("HELLO PCUTP/2 HRU? ")
+    peer.send_line(hello.replace("HELLO ", "HELLO? ", 1))
+    assert peer.recv_line(5.0).startswith("OHRU PCUTP/2 ")
+    peer.send_line("HRU")
     thread.join(5)
 
     assert accepted == [True]
 
 
-def test_three_way_handshake_server_rejects_non_sync_ack(tmp_path):
+def test_three_way_handshake_server_rejects_non_hru_ack(tmp_path):
     pipe = PipePair()
     pipe.left.read_timeout = pipe.right.read_timeout = 0.01
     results = []
@@ -237,8 +235,8 @@ def test_three_way_handshake_server_rejects_non_sync_ack(tmp_path):
     client_link = Link(pipe.right)
 
     client_link.send_line("HELLO PCUTP/2")
-    assert client_link.recv_line(5.0) == "HOWRU"
-    client_link.send_line("NOTSYNC")
+    assert client_link.recv_line(5.0).startswith("HELLO PCUTP/2 HRU? ")
+    client_link.send_line("NOTHRU")
     assert client_link.recv_line(5.0) == "ERR PROTOCOL"
     thread.join(10)
     assert results == []  # the handshake failed; nothing was transferred
@@ -292,9 +290,8 @@ def test_rehello_during_session_rehandshakes(tmp_path):
     # Peer restarts: a second HELLO mid-session must re-run the handshake,
     # not come back as ERR PROTOCOL.
     client.link.send_line("HELLO PCUTP/2")
-    assert client.link.recv_line(5.0) == "HOWRU"
-    client.link.send_line("SYNC")
-    assert client.link.recv_line(5.0).startswith("CONNECT ")
+    assert client.link.recv_line(5.0).startswith("HELLO PCUTP/2 HRU? ")
+    client.link.send_line("HRU")
 
     # And the session still carries a transfer afterwards.
     download = client.get("T.BIN", "https://example.com/t.bin")
@@ -346,9 +343,8 @@ def test_client_still_works_against_a_server_that_omits_fetching(tmp_path):
 
     def server_side():
         server_link.recv_line(5.0)
-        server_link.send_line("HOWRU")
-        server_link.recv_line(5.0)
-        server_link.send_line("CONNECT 460800 MAXBLK=64")
+        server_link.send_line("HELLO PCUTP/2 HRU? BAUD=115200 MAXBLK=64")
+        server_link.recv_line(5.0)  # HRU
         server_link.recv_line(5.0)  # GET; answered with META, no FETCHING
         crc = crc32_hex(payload)
         server_link.send_line(f"META OLD.BIN {len(payload)} 64 1 {crc}")

@@ -269,7 +269,9 @@ PCUTPでは、**制御情報はASCIIテキスト、ファイル本体はRAWバ�
 たとえば制御メッセージは、
 
 ```text
-HELLO PCUTP/2
+HELLO PCUTP/2 FLOW=1 MAXBLK=4096 WINDOW=2 RXBUF=16384 LZ4=1
+HELLO PCUTP/2 HRU? BAUD=115200 MAXBLK=4096 FLOW=1 WINDOW=1 LZ4=1
+HRU
 GET TEST.BAS https://example.com/test.bas
 META TEST.BAS 18342 4096 5 8B58A921
 DATA 0 4096 4A91F33C
@@ -370,10 +372,9 @@ TEST.BAS
 PCUTP/2（実装v2.1）では、以下の制御語を使用します。
 
 ```text
-接続         HELLO     発呼
-             HOWRU     応答トーン
-             SYNC      応答確認
-             CONNECT   キャリア確立（ベース速度・MAXBLKを通知）
+接続         HELLO     SYN: 挨拶と受信能力の提案
+             HRU?      SYN-ACK: 選択した条件の確認
+             HRU       ACK: 合意して通信開始
 
 転送         GET       ダウンロード要求
              FETCHING  受理。これからインターネットに出る
@@ -389,6 +390,8 @@ PCUTP/2（実装v2.1）では、以下の制御語を使用します。
 
 維持         PING      生存確認
              PONG      応答
+             AYT?      転送中の無応答に対する状態確認
+             HERE      生存応答と次に必要なシーケンス番号
              CLOSE     正常切断
              BYE       切断確認
 
@@ -396,7 +399,9 @@ PCUTP/2（実装v2.1）では、以下の制御語を使用します。
              RESUME    読み切り完了と次のシーケンス番号
 ```
 
-v0.2でv0.1から追加したのは `HOWRU` `SYNC` `CONNECT` `FETCHING` `PING` `PONG` `CLOSE` の7語です。
+現行の接続語は `HELLO` `HELLO?` `HRU?` `OHRU` `HRU` です。通常時は
+`HELLO` → `HELLO ... HRU?` → `HRU`、聞き返し時は`HELLO?` → `OHRU` → `HRU`
+という、人間の挨拶として読めるTCP型3-way handshakeです。
 これにより、**1回の接続で複数のファイルを続けてダウンロードできる**ようになり
 （v0.1では1ファイルごとに接続をやり直していました）、
 回線が切れたことを検出できるようになりました。

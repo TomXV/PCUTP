@@ -16,10 +16,16 @@ MAX_FILENAME_LEN = 64
 MAX_FILE_SIZE = 16 * 1024 * 1024  # 16 MiB
 
 MAX_RETRIES = 5          # per block, section 15
+MAX_DROPS = 3            # sequence gaps before restarting the file
+MAX_RESETS = 2           # full-file restarts before aborting
+FLOW_GROW_ACKS = 8       # clean cumulative ACKs before widening cwnd
 ACK_TIMEOUT = 15.0       # seconds; includes SD-card writes and recovery barriers
 MAX_TIMEOUTS = 5         # section 16
 LINE_TIMEOUT = 30.0      # generic control-line read timeout
 DATA_TIMEOUT = 20.0      # PicoCalc side: raw payload after a DATA header
+PROBE_GUARD = 6.0        # after ACK timeout, let a 20s raw read finish first
+PROBE_TIMEOUT = 3.0      # wait for one HERE response
+PROBE_RETRIES = 10       # tolerate a manually reconnected three-wire link
 
 # Teardown (section 7 of docs/PCUTP-session.md). CLOSE is FIN, BYE is FIN-ACK,
 # and each direction closes independently.
@@ -33,8 +39,9 @@ LINGER_TIME = 2.0
 
 KEEPALIVE_INTERVAL = 5.0   # idle seconds before sending a PING probe
 KEEPALIVE_TIMEOUT = 10.0   # silent seconds before declaring the link lost
-CONNECT_DELAY = 0.4        # server pause between HOWRU and CONNECT (dial-up)
-HANDSHAKE_TIMEOUT = 10.0   # client wait for HOWRU / CONNECT
+CONNECT_DELAY = 0.4        # retained API setting; handshake audio pacing only
+HANDSHAKE_TIMEOUT = 10.0   # wait for HELLO HRU? / OHRU / HRU
+HELLO_RETRIES = 10         # first HELLO plus nine HELLO? retries
 
 MAX_REDIRECTS = 5        # section 24
 HTTP_TIMEOUT = 30.0      # how long the server may spend on the internet leg

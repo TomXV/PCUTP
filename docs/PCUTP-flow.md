@@ -7,17 +7,25 @@
 ## 1. 接続時にバッファと機能を宣言する
 
 ```text
-PicoCalc -> HELLO PCUTP/2 (最大3回)
-         <- HOWRU
-         -> SYNC FLOW=1 MAXBLK=4096 WINDOW=2 RXBUF=16384 LZ4=1
-         <- CONNECT 115200 MAXBLK=4096 FLOW=1 WINDOW=2 LZ4=1
+PicoCalc -> HELLO PCUTP/2 FLOW=1 MAXBLK=4096 WINDOW=2 RXBUF=16384 LZ4=1
+         <- HELLO PCUTP/2 HRU? BAUD=115200 MAXBLK=4096 FLOW=1 WINDOW=2 LZ4=1
+         -> HRU
+```
+
+応答が来なければPicoCalcは2回目以降を`HELLO?`として最大10回まで送る。送信側は
+聞き返しを認識して、同じ合意案を`OHRU PCUTP/2 ...`で返す。最後の`HRU`は共通である。
+
+```text
+PicoCalc -> HELLO? PCUTP/2 FLOW=1 MAXBLK=4096 WINDOW=2 RXBUF=16384 LZ4=1
+         <- OHRU PCUTP/2 BAUD=115200 MAXBLK=4096 FLOW=1 WINDOW=2 LZ4=1
+         -> HRU
 ```
 
 `FLOW=1` は以下のウィンドウ・累積ACK・再送バリアをまとめてサポートする意味。
-`LZ4=1` は独立LZ4ブロックの受信対応を表す。送信側もCONNECTで返した機能だけを使う。
-旧受信側の裸のSYNCには従来の1ブロックずつの送信で応答する。
-旧送信側はSYNCの追加引数を無視し、FLOWのないCONNECTを返すため、新受信側も
-1ブロックずつの非圧縮通信へ戻る。
+最初のHELLOはTCPのSYN、`HELLO ... HRU?`はSYN-ACK、`HRU`はACKに相当する。
+人間の会話としては「この条件で話せる」「この合意内容でよい？」「よい、その内容で
+話そう」の3往復目で成立する。`LZ4=1`は独立LZ4ブロックの受信対応を表し、送信側は
+SYN-ACKで選択して返した機能だけを使う。
 
 MTU（本書ではDATAの展開後ペイロード上限）とウィンドウは次で制限する。
 
@@ -52,6 +60,10 @@ DATA 2 + payload ----------------->
 追加のRTS/CTS配線は使わず、任意のバイナリ値と衝突するXON/XOFFも使わない。
 ACK用の帯域はUARTの逆方向を利用する。
 
+送信側の実動作窓(cwnd)は1から始め、正常な累積ACKが8回続けば受信側が提示したWINDOW
+まで広げる。NAK、DROP、ACKタイムアウト、RSTのいずれかで直ちに1へ戻す。障害確認中は
+新しいDATAを送らない。受信側上限(rwnd)と回線状態(cwnd)を分けるTCP型の制御である。
+
 既存の `DATA <seq> <len> <crc>` を継続する。seqはファイルごとに0から始まり、
 ブロックごとに1増え、ファイル中では折り返さない。圧縮・非圧縮で同じ番号空間を使う。
 FLOWモードの `ACK n` は0〜nの連続ブロックを保存したという累積確認。
@@ -60,6 +72,12 @@ FLOWモードの `ACK n` は0〜nの連続ブロックを保存したという�
 最終ブロック後もDONEまでDATAを処理し、最後のACK欠落にも対応する。
 
 ## 3. 再送時のバリア
+
+受信側は期待番号より先の`DATA`を受けた場合、`DROP <expected> <received>`で欠落を
+明示する。送信側は新規送信を止め、BARRIER/RESUMEで古い飛行分を排出してexpectedから
+再送する。同一ファイルでDROPが3回に達すると受信側は`.PART`と通算CRCを初期化し、
+`RST 0`を送る。送信側もシーケンス0へ戻って全ファイルを再送する。RSTは最大2回で、
+それを超える回線障害は`ERR RETRY`として終了する。CRC破損は`NAK <seq> CRC`を使う。
 
 NAKやACKタイムアウトで直ちに新しいフレームを送り足すと、古い先行データと再送分が
 重なって窓を超え得る。そこでDATA送信を止め、同じ順序付きバイト列にバリアを置く。
@@ -85,9 +103,33 @@ ACKだけが欠落していた場合はデータの再送を省略できる。
 バイト欠落でRAWの境界自体が失われた場合は、タイムアウト／プロトコルエラーで
 中断し、完成ファイルにはしない。任意の破損から自動再同期する機構ではない。
 
+### 3.1 転送中の無応答確認
+
+ACKが15秒来なくても、受信側は最大20秒のRAW受信中かもしれない。RAWの途中へ制御行を
+送ると`AYT?`自体がファイル内容になるため、送信側はさらに6秒待ち、その間に遅いACK、
+NAK、DROPが来れば通常の回復へ渡す。その後だけ次を最大10回、3秒間隔で送る。
+
+```text
+uConsole -> AYT? <probe-id>
+PicoCalc -> HERE <probe-id> <next-seq>
+```
+
+probe-idは遅延した古いHEREとの混同を防ぐ。HEREを受けても直ちにDATAを送らず、必ず
+BARRIER/RESUMEを交換してバイト境界を確定し、next-seqからWINDOW=1で再開する。
+PicoCalcでRAW受信が20秒以内に完了しなければプログラムを終了せず、受信途中のブロックを
+破棄して`DROP <expected> RAW`を返す。AYT?に10回応答がなければリンク喪失とする。
+
+```text
+ACK timeout -> 6s guard -> AYT? -> HERE -> BARRIER -> RESUME -> retransmit
+RAW timeout --------------------> DROP RAW -------^
+```
+
+RTS/CTSは使わない。TX、RX、GNDの3線だけで、WINDOW/ACKによる通常のバックプレッシャーと
+この障害回復を行う。
+
 ## 4. MTUの自動選択
 
-CONNECTのMAXBLKは上限であり、各ファイルの実際のMTUはMETAで通知する。
+SYN-ACKのMAXBLKは上限であり、各ファイルの実際のMTUはMETAで通知する。
 `--block auto`（既定）では256・512・1024・2048・4096と受信側上限を候補にする。
 窓が1の相手には許可された最大値を使う。窓が2の場合は今回のPicoCalc実測に基づく
 次の比較用コストを最小にする候補を選ぶ。
@@ -185,9 +227,9 @@ HTTPはホスト上の固定データで置き換え、インターネット変�
 | `FAIL` | 110 Hz | 矩形波 | 45 ms |
 | `ERR` | 98 Hz | 矩形波 | 45 ms |
 | `CLOSE` | 82 Hz | 正弦波 | 45 ms |
-| `HOWRU` | 587 Hz | 正弦波 | 45 ms |
-| `SYNC` | 466 Hz | 正弦波 | 12 ms |
-| `CONNECT` | 659 Hz | 正弦波 | 45 ms |
+| `HELLO?` | 277 Hz | 正弦波 | 45 ms |
+| `OHRU` | 370 Hz | 正弦波 | 45 ms |
+| `HRU` | 466 Hz | 正弦波 | 12 ms |
 | `PING` | 740 Hz | 正弦波 | 12 ms |
 | `PONG` | 831 Hz | 正弦波 | 12 ms |
 

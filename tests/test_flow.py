@@ -22,11 +22,12 @@ def transfer(tmp_path, *, size=1537, fault="none", block=256, window=2, payload_
         size = len(payload)
     result, failures, sent, replies = [], [], [], []
     damaged = False
+    dropped_data = 0
     dropped_resume = False
     original_tx, original_rx = pipe.left.write, pipe.right.write
 
     def tx(data):
-        nonlocal damaged
+        nonlocal damaged, dropped_data
         if data.startswith((b"DATA ", b"ZDATA ")):
             header, raw = data.split(b"\n", 1)
             seq = int(header.split()[1])
@@ -36,6 +37,9 @@ def transfer(tmp_path, *, size=1537, fault="none", block=256, window=2, payload_
                     original_tx(data)
             if fault == "lost_data" and seq == 1 and not damaged:
                 damaged = True
+                return len(data)
+            if fault == "repeated_drop" and seq == 1 and dropped_data < 3:
+                dropped_data += 1
                 return len(data)
             if (fault in {"crc", "crc_lost_resume", "crc_duplicate_resume"}
                     and seq == 1 and not damaged):
@@ -62,6 +66,7 @@ def transfer(tmp_path, *, size=1537, fault="none", block=256, window=2, payload_
     server = PcutpServer(
         Link(pipe.left), fetcher=lambda url, **kw: Fetched(payload, url),
         block_size=block, window_size=window, connect_delay=0, ack_timeout=0.1,
+        probe_guard=0.01, probe_timeout=0.01,
     )
     client = PcutpClient(Link(pipe.right), tmp_path)
 
@@ -94,22 +99,22 @@ def test_flow_boundaries(tmp_path, size, window):
 
 @pytest.mark.parametrize("fault", ["crc", "crc_lost_resume", "crc_duplicate_resume", "lost_ack",
                                   "lost_all_acks", "duplicate_ack", "duplicate_data",
-                                  "duplicate_last", "lost_data"])
+                                  "duplicate_last", "lost_data", "repeated_drop"])
 def test_fault_recovery(tmp_path, fault):
     result, sent, replies = transfer(tmp_path, fault=fault)
-    if fault.startswith("crc") or fault == "lost_data":
+    if fault.startswith("crc") or fault in {"lost_data", "repeated_drop"}:
         assert result.retransmits >= 1
         assert any(line.startswith(b"RESUME ") for line in replies)
-        assert sent.count(1) == 2
+        assert sent.count(1) >= 2
     else:
         # Cumulative ACK or barrier recovers lost ACKs without resending data.
         assert result.retransmits == 0
 
 
 @pytest.mark.parametrize("capabilities,block,window", [
-    ("SYNC", 4096, 1),
-    ("SYNC FLOW=1 MAXBLK=1024 WINDOW=2 RXBUF=16384", 1024, 2),
-    ("SYNC FLOW=1 MAXBLK=4096 WINDOW=2 RXBUF=8192", 4096, 1),
+    ("", 4096, 1),
+    ("FLOW=1 MAXBLK=1024 WINDOW=2 RXBUF=16384", 1024, 2),
+    ("FLOW=1 MAXBLK=4096 WINDOW=2 RXBUF=8192", 4096, 1),
 ])
 def test_receiver_limits_are_respected(capabilities, block, window):
     class ScriptedLink:
@@ -117,13 +122,13 @@ def test_receiver_limits_are_respected(capabilities, block, window):
         sound = Sound(enabled=False)
 
         def recv_line(self, timeout):
-            return capabilities
+            return "HRU"
 
         def send_line(self, line):
             pass
 
     server = PcutpServer(ScriptedLink(), connect_delay=0)
-    assert server._handle_hello("HELLO PCUTP/2")
+    assert server._handle_hello(("HELLO PCUTP/2 " + capabilities).rstrip())
     assert server.block_size == block
     assert server.window_size == window
 
@@ -149,7 +154,8 @@ def test_sender_stops_at_window_until_ack():
             self.sent.append(seq)
 
         def recv_line(self, timeout):
-            assert len(self.sent) == min(5, self.acks + 2)
+            # Congestion window starts at one and grows only after clean ACKs.
+            assert len(self.sent) == min(5, self.acks + 1)
             ack = self.acks
             self.acks += 1
             return f"ACK {ack}"
@@ -159,6 +165,65 @@ def test_sender_stops_at_window_until_ack():
     server.window_size = 2
     assert server._send_window(b"x" * 300, 5) == 0
     assert peer.sent == list(range(5))
+
+
+def test_congestion_window_grows_after_eight_clean_acks():
+    class Peer:
+        def __init__(self):
+            self.sent = []
+            self.next_ack = 0
+            self.in_flight_at_read = []
+
+        def send_line_and_raw(self, line, data):
+            self.sent.append(int(line.split()[1]))
+
+        def recv_line(self, timeout):
+            self.in_flight_at_read.append(len(self.sent) - self.next_ack)
+            ack = self.next_ack
+            self.next_ack += 1
+            return f"ACK {ack}"
+
+    peer = Peer()
+    server = PcutpServer(peer, block_size=1)
+    server.window_size = 2
+    assert server._send_window(bytes(range(12)), 12) == 0
+    assert peer.sent == list(range(12))
+    assert peer.in_flight_at_read[:8] == [1] * 8
+    assert peer.in_flight_at_read[8:] == [2, 2, 2, 1]
+
+
+def test_congestion_window_returns_to_one_after_nak():
+    class Peer:
+        def __init__(self):
+            self.sent = []
+            self.next_ack = 0
+            self.nak_sent = False
+            self.sent_at_nak = 0
+            self.first_read_after_nak = None
+
+        def send_line_and_raw(self, line, data):
+            self.sent.append(int(line.split()[1]))
+
+        def recv_line(self, timeout):
+            in_flight = len(self.sent) - self.next_ack
+            if self.next_ack == 8 and not self.nak_sent:
+                assert in_flight == 2
+                self.nak_sent = True
+                self.sent_at_nak = len(self.sent)
+                return "NAK 8 CRC"
+            if self.nak_sent and self.first_read_after_nak is None:
+                self.first_read_after_nak = len(self.sent) - self.sent_at_nak
+            ack = self.next_ack
+            self.next_ack += 1
+            return f"ACK {ack}"
+
+    peer = Peer()
+    server = PcutpServer(peer, block_size=1)
+    server.window_size = 2
+    server._recover_window = lambda base, sent: base
+    assert server._send_window(bytes(range(12)), 12) == 2
+    assert peer.first_read_after_nak == 1
+    assert peer.sent.count(8) == 2
 
 
 @pytest.mark.parametrize("fault", ["none", "crc", "lost_all_acks"])
@@ -234,7 +299,7 @@ def test_repeated_damage_has_a_finite_retry_budget():
     server.window_size = 2
     with pytest.raises(RetryError):
         server._send_window(b"x" * 128, 2)
-    assert peer.sends == 6  # three bounded flights, then abort
+    assert peer.sends == 3  # cwnd=1: three bounded attempts, then abort
 
 
 def test_ack_for_unsent_sequence_is_rejected():

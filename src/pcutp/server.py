@@ -8,6 +8,7 @@ from . import const
 from .compression import compress, worthwhile
 from .crc import crc32_hex
 from .errors import (
+    LinkLostError,
     PcutpError,
     ProtocolError,
     RetryError,
@@ -51,6 +52,9 @@ class PcutpServer:
         keepalive_timeout: float = const.KEEPALIVE_TIMEOUT,
         window_size: int = MAX_WINDOW,
         compression: bool = True,
+        probe_guard: float = const.PROBE_GUARD,
+        probe_timeout: float = const.PROBE_TIMEOUT,
+        probe_retries: int = const.PROBE_RETRIES,
     ):
         self.link = link
         self.fetcher = fetcher
@@ -67,6 +71,9 @@ class PcutpServer:
         self.flow = False
         self._barrier_id = 0
         self.compression_enabled = compression
+        self.probe_guard = probe_guard
+        self.probe_timeout = probe_timeout
+        self.probe_retries = probe_retries
         self.compression = False
         self._use_compression = False
         self.compressed_blocks = self.data_wire_bytes = 0
@@ -87,7 +94,7 @@ class PcutpServer:
 
     # -- top level -------------------------------------------------------
     def serve_once(self, timeout: float = const.LINE_TIMEOUT) -> None:
-        """HELLO..CONNECT handshake, then GETs until the link is lost.
+        """Three-way HELLO/HELLO-HRU?/HRU handshake, then serve GETs.
 
         Returns None if the handshake fails; otherwise it keeps serving GETs
         (reporting each via on_result) until LinkLostError or a protocol
@@ -140,32 +147,14 @@ class PcutpServer:
 
     def _handle_hello(self, line: str) -> bool:
         parts = line.split()
-        if len(parts) != 2 or parts[0] != "HELLO":
+        if len(parts) < 2 or parts[0] not in ("HELLO", "HELLO?"):
             self._fail(ProtocolError(f"expected HELLO, got {line!r}"))
             return False
         if parts[1] != const.PROTOCOL_VERSION:
             self._fail(VersionError(f"unsupported version {parts[1]!r}"))
             return False
         self.link.sound.dial()
-        self.link.send_line("HOWRU")
-        self.link.sound.handshake_ring()
-        self.link.sound.handshake_carrier()
-        deadline = time.monotonic() + const.HANDSHAKE_TIMEOUT
-        while True:
-            reply = self.link.recv_line(max(0, deadline - time.monotonic()))
-            # HOWRU can be lost just as the receiver's HELLO timer expires.
-            # Treat the resulting duplicate HELLO as a repeated call instead
-            # of rejecting it while waiting for SYNC.
-            if reply == f"HELLO {const.PROTOCOL_VERSION}":
-                self.link.send_line("HOWRU")
-                deadline = time.monotonic() + const.HANDSHAKE_TIMEOUT
-                continue
-            break
-        sync = reply.split()
-        if not sync or sync[0] != "SYNC":
-            self._fail(ProtocolError(f"expected SYNC, got {reply!r}"))
-            return False
-        capabilities = options(sync[1:])
+        capabilities = options(parts[2:])
         self.block_size = min(self.block_limit, capabilities.get("MAXBLK", self.block_limit))
         self.negotiated_block_limit = self.block_size
         self.flow = capabilities.get("FLOW") == 1
@@ -181,8 +170,26 @@ class PcutpServer:
             extra = f" FLOW=1 WINDOW={self.window_size}"
             if self.compression:
                 extra += " LZ4=1"
-        time.sleep(self.connect_delay)
-        self.link.send_line(f"CONNECT {self.baud} MAXBLK={self.block_size}{extra}")
+        proposal_tail = (f"{const.PROTOCOL_VERSION} BAUD={self.baud} "
+                         f"MAXBLK={self.block_size}{extra}")
+        proposal = (("HELLO " + const.PROTOCOL_VERSION + " HRU? "
+                     + proposal_tail.split(" ", 1)[1]) if parts[0] == "HELLO"
+                    else "OHRU " + proposal_tail)
+        self.link.send_line(proposal)
+        self.link.sound.handshake_ring()
+        self.link.sound.handshake_carrier()
+        deadline = time.monotonic() + const.HANDSHAKE_TIMEOUT
+        while True:
+            reply = self.link.recv_line(max(0, deadline - time.monotonic()))
+            if reply.startswith((f"HELLO {const.PROTOCOL_VERSION}",
+                                 f"HELLO? {const.PROTOCOL_VERSION}")):
+                self.link.send_line("OHRU " + proposal_tail)
+                deadline = time.monotonic() + const.HANDSHAKE_TIMEOUT
+                continue
+            break
+        if reply != "HRU":
+            self._fail(ProtocolError(f"expected HRU, got {reply!r}"))
+            return False
         self.link.sound.handshake_connected()
         return True
 
@@ -295,11 +302,13 @@ class PcutpServer:
         ordered barrier before retransmitting. Otherwise delayed ACKs and
         repeated NAKs could create overlapping flights and overflow the UART.
         """
-        base = next_seq = retransmits = recoveries = 0
+        base = next_seq = retransmits = recoveries = resets = 0
+        cwnd = 1
+        clean_acks = 0
         attempts: dict[int, int] = {}
         frames: dict[int, tuple[str, bytes]] = {}
         while base < blocks:
-            while next_seq < min(blocks, base + self.window_size):
+            while next_seq < min(blocks, base + cwnd):
                 count = attempts.get(next_seq, 0)
                 if count > self.max_retries:
                     raise RetryError(f"block {next_seq} exhausted retries")
@@ -323,8 +332,16 @@ class PcutpServer:
                 try:
                     reply = self.link.recv_line(max(0, deadline - time.monotonic()))
                 except TimeoutError_:
-                    reply = ""
+                    cwnd = 1
+                    clean_acks = 0
+                    reply = self._probe_receiver(base)
                 parts = reply.split()
+                if parts[:1] == ["HERE"]:
+                    if time.monotonic() >= deadline:
+                        reply = self._probe_receiver(base)
+                        parts = reply.split()
+                    else:
+                        continue
                 if len(parts) == 2 and parts[0] == "ACK" and parts[1].isdecimal():
                     ack = int(parts[1])
                     if ack >= next_seq:
@@ -334,17 +351,39 @@ class PcutpServer:
                             raise TimeoutError_("only duplicate ACKs received")
                         continue  # duplicate ACK never releases additional credit
                     base = ack + 1
+                    clean_acks += 1
+                    if clean_acks >= const.FLOW_GROW_ACKS:
+                        cwnd = self.window_size
                     attempts = {seq: n for seq, n in attempts.items() if seq >= base}
                     frames = {seq: frame for seq, frame in frames.items() if seq >= base}
                     recoveries = 0
                     if self.on_progress:
                         self.on_progress(min(base * self.block_size, len(data)), len(data))
                     break
-                if not parts or parts[0] == "NAK":
-                    recoveries += 1
+                if len(parts) == 2 and parts[0] == "RST" and parts[1] == "0":
+                    resets += 1
+                    if resets > const.MAX_RESETS:
+                        raise RetryError("receiver exhausted full-file resets")
+                    # Drain any tail of the old flight before sequence zero is
+                    # sent again, or stale DATA can be mistaken for the new file.
+                    if self._recover_window(0, next_seq) != 0:
+                        raise ProtocolError("receiver did not reset to sequence zero")
+                    base = next_seq = 0
+                    cwnd = 1
+                    clean_acks = 0
+                    attempts.clear()
+                    recoveries = 0
+                    if self.on_progress:
+                        self.on_progress(0, len(data))
+                    break
+                if not parts or parts[0] in {"NAK", "DROP"}:
+                    cwnd = 1
+                    clean_acks = 0
+                    old_base = base
+                    base = self._recover_window(base, next_seq)
+                    recoveries = 0 if base > old_base else recoveries + 1
                     if recoveries > self.max_retries:
                         raise RetryError("window recovery exhausted retries")
-                    base = self._recover_window(base, next_seq)
                     attempts = {seq: n for seq, n in attempts.items() if seq >= base}
                     frames = {seq: frame for seq, frame in frames.items() if seq >= base}
                     next_seq = base
@@ -355,6 +394,39 @@ class PcutpServer:
                     continue
                 raise ProtocolError(f"unexpected window reply: {reply!r}")
         return retransmits
+
+    def _probe_receiver(self, expected: int) -> str:
+        """Ask a silent receiver where it stopped, without entering raw data.
+
+        ACK_TIMEOUT expires before the receiver's raw timeout.  The guard is
+        therefore mandatory: an AYT? sent earlier could become file payload.
+        A late ACK/DROP during the guard is returned to the normal state
+        machine.  HERE is converted to DROP so recovery always establishes a
+        fresh BARRIER/RESUME boundary before more DATA is sent.
+        """
+        try:
+            late = self.link.recv_line(self.probe_guard)
+            if late:
+                return late
+        except TimeoutError_:
+            pass
+        self._barrier_id += 1
+        probe = str(self._barrier_id)
+        for _ in range(self.probe_retries):
+            self.link.send_line(f"AYT? {probe}")
+            try:
+                parts = self.link.recv_line(self.probe_timeout).split()
+            except TimeoutError_:
+                continue
+            if (len(parts) == 3 and parts[:2] == ["HERE", probe]
+                    and parts[2].isdecimal()):
+                next_seq = int(parts[2])
+                if next_seq < 0:
+                    raise ProtocolError("invalid HERE sequence")
+                return f"DROP {next_seq} {next_seq}"
+            if parts and parts[0] in {"ACK", "NAK", "DROP", "RST", "ERR"}:
+                return " ".join(parts)
+        raise LinkLostError("receiver did not answer AYT?")
 
     def _old_resume(self, parts: list[str]) -> bool:
         return (len(parts) == 3 and parts[0] == "RESUME" and parts[1].isdecimal()
@@ -375,7 +447,7 @@ class PcutpServer:
                     if not parts[2].isdecimal() or not base <= int(parts[2]) <= sent:
                         raise ProtocolError("invalid recovery sequence")
                     return int(parts[2])
-                if parts and parts[0] in {"ACK", "NAK", "RESUME"}:
+                if parts and parts[0] in {"ACK", "NAK", "DROP", "RESUME"}:
                     continue
                 raise ProtocolError(f"unexpected recovery reply: {parts!r}")
         raise TimeoutError_("recovery barrier was not acknowledged")

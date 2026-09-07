@@ -5,7 +5,7 @@
 ' NOTE: this is the reference receiver; the Python client in src/pcutp/client.py
 ' implements the same state machine and is what CI exercises.
 '
-' v0.2 adds the dial-up handshake (HELLO -> HOWRU -> SYNC -> CONNECT), keep-alive
+' v0.2 uses a TCP-like human greeting (HELLO -> HELLO HRU? -> HRU), keep-alive
 ' (answer PING with PONG), non-blocking line input, link-loss detection, the
 ' FETCHING notice that covers the silent internet leg, and a persistent session
 ' that stays connected across downloads instead of ending after the first file.
@@ -28,8 +28,10 @@ Const CLSTMO    = 3000        ' ms to wait for BYE before resending CLOSE
 Const CLSRTY    = 3           ' CLOSE attempts before dropping the link
 Const LINGERMS  = 2000        ' ms to keep answering a repeated CLOSE
 Const DATTMO    = 20000       ' ms, raw payload after a DATA header
-Const HSTMO     = 10000       ' ms, dial-up handshake wait (HOWRU / CONNECT)
-Const HELLO_RETRIES = 3       ' repeat the initial call if the UART was late
+Const HSTMO     = 10000       ' ms, wait for the server's HELLO HRU? proposal
+Const HELLO_RETRIES = 10      ' initial HELLO plus nine HELLO? retries
+Const DROP_MAX  = 3           ' sequence gaps before restarting the file
+Const RESET_MAX = 2           ' full-file restarts before aborting
 ' Single fixed line rate. Rate negotiation was removed after hardware testing:
 ' the Flipper USB-UART bridge carried 115200 reliably but corrupted 4096-byte
 ' blocks at faster rates, so the port stays open at BASEBAUD for the session.
@@ -62,6 +64,7 @@ Const HZ_RX_META  = 587       ' <- META
 Const HZ_RX_DATA  = 659       ' <- DATA (once per block)
 Const HZ_RX_DONE  = 784       ' <- DONE
 Const HZ_RX_ERR   = 175       ' <- ERR
+Const HZ_RX_AYT   = 698       ' <- AYT? liveness probe
 
 Const HZ_TX_HELLO = 1047      ' -> HELLO
 Const HZ_TX_GET   = 1175      ' -> GET
@@ -70,6 +73,7 @@ Const HZ_TX_ACK   = 1568      ' -> ACK (once per block)
 Const HZ_TX_NAK   = 294       ' -> NAK
 Const HZ_TX_OK    = 1760      ' -> OK
 Const HZ_TX_FAIL  = 220       ' -> FAIL / ERR
+Const HZ_TX_HERE  = 1760      ' -> HERE with next expected sequence
 Const HZ_CLOSE    = 196       ' -> CLOSE (graceful hangup, low falling note)
 Const HZ_BYE      = 262       ' <- BYE   (the close is acknowledged)
 
@@ -92,9 +96,9 @@ Dim buf%(BLKMAX \ 8)          ' 8 bytes per 64-bit element
 Dim unpack%(BLKMAX \ 8)       ' bounded output for independent LZ4 blocks
 Dim rtab%(255)                ' byte-reflect table, for chaining MATH(CRC32 ...)
 
-Dim s$, fn$, url$, meta$(5)
-Dim size, blksz, blocks, seq, ln, want$, got$, helloTry
-Dim fcrc, running, i, n, retries, wpos, wchunk, rcvd
+Dim s$, fn$, url$, meta$(8)
+Dim size, blksz, blocks, seq, ln, want$, got$, helloTry, answerAt
+Dim fcrc, running, i, n, retries, wpos, wchunk, rcvd, drops, resets
 Dim crcBlockOut, crcRunningOut
 Dim ws$
 Dim lastRx, maxblk            ' keep-alive liveness + negotiated block size
@@ -124,10 +128,8 @@ kaWin = KATMO
 Print "PCUTP v2.1"
 
 ' ---- dial-up handshake -----------------------------------------------
-' Ring out: send HELLO, expect the bare answer tone HOWRU, then confirm with
-' a SYNC blip (the client's ACK), then the CONNECT line that brings the
-' carrier up and negotiates MAXBLK. ERR ... (notably ERR VERSION) is the
-' refusal.
+' TCP-like three-way greeting: offer capabilities with HELLO (SYN), receive
+' the selected parameters in HELLO ... HRU? (SYN-ACK), then answer HRU (ACK).
 Print "Dialing..."
 For helloTry = 1 To HELLO_RETRIES
   Print "HELLO " + Str$(helloTry) + "/" + Str$(HELLO_RETRIES)
@@ -137,30 +139,36 @@ For helloTry = 1 To HELLO_RETRIES
   Pause 100
   Tone1 1477, 100
   Pause 130
-  Print #1, "HELLO " + VER$
+  If helloTry = 1 Then
+    Print #1, "HELLO " + VER$ + " FLOW=1 MAXBLK=" + Str$(BLKMAX) + " WINDOW=" + Str$(WINMAX) + " RXBUF=" + Str$(RXBUFSZ) + " LZ4=1"
+  Else
+    Print #1, "HELLO? " + VER$ + " FLOW=1 MAXBLK=" + Str$(BLKMAX) + " WINDOW=" + Str$(WINMAX) + " RXBUF=" + Str$(RXBUFSZ) + " LZ4=1"
+  EndIf
   ' A silent peer is expected during the initial call.  Restart the
   ' liveness clock for every attempt so KATMO does not cut off retries.
   lastRx = Timer
   s$ = RecvLine$(HSTMO)
-  If s$ = "HOWRU" Then Exit For
+  If Left$(s$, Len("HELLO " + VER$ + " HRU?")) = "HELLO " + VER$ + " HRU?" Or Left$(s$, Len("OHRU " + VER$)) = "OHRU " + VER$ Then Exit For
   If helloTry < HELLO_RETRIES Then Pause 250
 Next helloTry
 If Left$(s$, 3) = "ERR" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print s$: End
-If s$ <> "HOWRU" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print " no answer tone": End
+If Left$(s$, Len("HELLO " + VER$ + " HRU?")) <> "HELLO " + VER$ + " HRU?" And Left$(s$, Len("OHRU " + VER$)) <> "OHRU " + VER$ Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print " no answer tone": End
 Tone1 HZ_ANSWER, MS_WORD
 Print "Carrier detected"
 Tone1 HZ_SYNC, MS_BLIP
-Print #1, "SYNC FLOW=1 MAXBLK=" + Str$(BLKMAX) + " WINDOW=" + Str$(WINMAX) + " RXBUF=" + Str$(RXBUFSZ) + " LZ4=1"
-
-s$ = RecvLine$(HSTMO)
-If Left$(s$, 3) = "ERR" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print s$: End
-Split s$, meta$()                       ' CONNECT <baud> MAXBLK=<n>
-If meta$(0) <> "CONNECT" Or meta$(1) = "" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print " no carrier": End
+Split s$, meta$()                       ' HELLO ... HRU? ..., or retry OHRU ...
+If meta$(0) = "HELLO" And meta$(1) = VER$ And meta$(2) = "HRU?" Then
+  answerAt = 3
+ElseIf meta$(0) = "OHRU" And meta$(1) = VER$ Then
+  answerAt = 2
+Else
+  Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print " no carrier": End
+EndIf
 maxblk = BLKMAX
 winsz = 1
 flowOn = 0
 zipOn = 0
-For i = 2 To Bound(meta$(), 1)
+For i = answerAt To Bound(meta$(), 1)
   If Left$(meta$(i), 7) = "MAXBLK=" Then
     maxblk = Val(Mid$(meta$(i), 8))
     If maxblk < 1 Or maxblk > BLKMAX Then Print "Invalid MAXBLK": End
@@ -173,7 +181,8 @@ If Not flowOn Then winsz = 1
 If winsz < 1 Or winsz > WINMAX Then Print "Invalid WINDOW": End
 If winsz * (maxblk + 64) > RXBUFSZ Then Print "Invalid RXBUF": End
 Tone1 HZ_CONNECT, MS_WORD
-Print "CONNECT " + meta$(1)
+Print #1, "HRU"
+Print "CONNECT " + Str$(BASEBAUD)
 Print "MAXBLK=" + Str$(maxblk)
 Print "WINDOW=" + Str$(winsz)
 
@@ -236,6 +245,8 @@ Do
   running = 0
   seq = 0
   rcvd = 0
+  drops = 0
+  resets = 0
   lastProgress = Timer
   Do
     s$ = RecvLine$(2 * ACKTMO)
@@ -270,7 +281,9 @@ Do
     ' per-chunk during reception (the first attempt) cost ~2x the line rate
     ' at 460800 baud and overran the UART FIFO, silently corrupting bytes.
     If Not RecvRaw(ln, DATTMO) Then
-      Tone1 HZ_TX_FAIL, MS_WORD: SndFail: Print #1, "ERR TIMEOUT": Close #2: Print "timeout": End
+      Tone1 HZ_TX_NAK, MS_WORD
+      Print #1, "DROP " + Str$(seq) + " RAW"
+      Continue Do
     EndIf
 
     If zipped Then
@@ -288,7 +301,21 @@ Do
       If flowOn Then Print #1, "ACK " + Str$(seq - 1) Else Print #1, "ACK " + Str$(n)
       Continue Do
     EndIf
-    If n <> seq Then Tone1 HZ_TX_NAK, MS_WORD: Print #1, "NAK " + Str$(seq) + " SEQ": Continue Do
+    If n <> seq Then
+      drops = drops + 1
+      Tone1 HZ_TX_NAK, MS_WORD
+      If drops >= DROP_MAX Then
+        resets = resets + 1
+        If resets > RESET_MAX Then Print #1, "ERR RETRY": Close #2: End
+        Close #2
+        Open DEST$ + fn$ + ".PART" For Output As #2
+        running = 0: seq = 0: rcvd = 0: drops = 0
+        Print #1, "RST 0"
+      Else
+        Print #1, "DROP " + Str$(seq) + " " + Str$(n)
+      EndIf
+      Continue Do
+    EndIf
     wchunk = size - rcvd
     If wchunk > blksz Then wchunk = blksz
     If ln <> wchunk Then Print #1, "ERR PROTOCOL": Close #2: End
@@ -512,6 +539,10 @@ Function RecvLine$(tmo)
       If ch$ = Chr$(10) Then
         If s$ = "PING" Then
           Print #1, "PONG"
+        ElseIf Left$(s$, 5) = "AYT? " Then
+          Tone1 HZ_RX_AYT, MS_WORD
+          Print #1, "HERE " + Mid$(s$, 6) + " " + Str$(seq)
+          Tone1 HZ_TX_HERE, MS_WORD
         ElseIf s$ <> "PONG" Then
           RecvLine$ = s$
           Exit Function
@@ -559,6 +590,7 @@ Function InputAlive$(prompt$)
       ch$ = Input$(1, #1)
       If ch$ = Chr$(10) Then
         If u$ = "PING" Then Print #1, "PONG"
+        If Left$(u$, 5) = "AYT? " Then Print #1, "HERE " + Mid$(u$, 6) + " " + Str$(seq)
         ' The uConsole is shutting down. Answering and quitting the prompt is
         ' what turns a clean shutdown into "Disconnected" instead of the
         ' keep-alive timer reporting it as "Link lost" ten seconds later.

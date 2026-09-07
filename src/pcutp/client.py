@@ -66,26 +66,31 @@ class PcutpClient:
         self.compression = False
 
     def hello(self, timeout: float = const.HANDSHAKE_TIMEOUT) -> int:
-        """Dial in: expect HOWRU (answer tone) then CONNECT (carrier up).
+        """TCP-like three-way greeting: HELLO, HELLO HRU?, HRU.
 
         Returns the MAXBLK block size negotiated by the server.
         """
-        self.link.send_line(f"HELLO {const.PROTOCOL_VERSION}")
-        howru = self.link.recv_line(timeout)
-        self._raise_for_err(howru)
-        if howru != "HOWRU":
-            raise ProtocolError(f"expected HOWRU, got {howru!r}")
-        self.link.send_line(
-            f"SYNC FLOW=1 MAXBLK={self.max_block_size} "
+        offer = (
+            f"{const.PROTOCOL_VERSION} FLOW=1 MAXBLK={self.max_block_size} "
             f"WINDOW={self.window_limit} RXBUF={self.receive_buffer}"
             + (" LZ4=1" if self.compression_enabled else "")
         )
-        connect = self.link.recv_line(timeout)
-        self._raise_for_err(connect)
-        parts = connect.split()
-        if len(parts) < 2 or parts[0] != "CONNECT":
-            raise ProtocolError(f"expected CONNECT, got {connect!r}")
-        capabilities = options(parts[2:])
+        answer = ""
+        for attempt in range(const.HELLO_RETRIES):
+            self.link.send_line(("HELLO" if attempt == 0 else "HELLO?") + " " + offer)
+            try:
+                answer = self.link.recv_line(timeout)
+                break
+            except TimeoutError_:
+                if attempt == const.HELLO_RETRIES - 1:
+                    raise
+        self._raise_for_err(answer)
+        parts = answer.split()
+        normal = parts[:3] == ["HELLO", const.PROTOCOL_VERSION, "HRU?"]
+        repeated = parts[:2] == ["OHRU", const.PROTOCOL_VERSION]
+        if not normal and not repeated:
+            raise ProtocolError(f"expected HELLO ... HRU? or OHRU, got {answer!r}")
+        capabilities = options(parts[3:] if normal else parts[2:])
         maxblk = capabilities.get("MAXBLK", const.DEFAULT_BLOCK_SIZE)
         self.flow = capabilities.get("FLOW") == 1
         self.compression = self.flow and capabilities.get("LZ4") == 1
@@ -95,6 +100,7 @@ class PcutpClient:
         if (maxblk > self.max_block_size or self.window_size > self.window_limit
                 or self.window_size * (maxblk + FRAME_OVERHEAD) > self.receive_buffer):
             raise ProtocolError("sender exceeded receiver capabilities")
+        self.link.send_line("HRU")
         self.peer_closing = False
         return maxblk
 
@@ -161,11 +167,15 @@ class PcutpClient:
         expected = 0
         running = 0
         received = 0
+        drops = resets = 0
         with open(part, "wb") as handle:
             while True:
                 header = self.link.recv_line(const.ACK_TIMEOUT * 2)
                 self._raise_for_err(header)
                 parts = header.split()
+                if len(parts) == 2 and parts[0] == "AYT?" and parts[1].isdecimal():
+                    self.link.send_line(f"HERE {parts[1]} {expected}")
+                    continue
                 if parts[:1] == ["DONE"]:
                     if expected != meta.blocks:
                         raise ProtocolError("DONE before all blocks arrived")
@@ -197,8 +207,9 @@ class PcutpClient:
                 try:
                     payload = self.link.recv_exact(length, const.DATA_TIMEOUT)
                 except TimeoutError_:
-                    self.link.send_line("ERR TIMEOUT")
-                    raise
+                    self.link.discard_input()
+                    self.link.send_line(f"DROP {expected} RAW")
+                    continue
                 if packed:
                     try:
                         payload = decompress(payload, raw_length)
@@ -214,8 +225,18 @@ class PcutpClient:
                     self.link.send_line(f"ACK {expected - 1}" if self.flow else f"ACK {seq}")
                     continue
                 if seq != expected:
-                    # Out of order or a duplicate: ask for the one we still need.
-                    self.link.send_line(f"NAK {expected} SEQ")
+                    drops += 1
+                    if drops >= const.MAX_DROPS:
+                        resets += 1
+                        if resets > const.MAX_RESETS:
+                            self.link.send_line("ERR RETRY")
+                            raise ProtocolError("too many sequence resets")
+                        handle.seek(0)
+                        handle.truncate()
+                        expected = running = received = drops = 0
+                        self.link.send_line("RST 0")
+                    else:
+                        self.link.send_line(f"DROP {expected} {seq}")
                     continue
                 if length != min(meta.blocksize, meta.size - received):
                     self.link.send_line("ERR PROTOCOL")

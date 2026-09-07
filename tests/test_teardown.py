@@ -46,9 +46,8 @@ def test_the_close_is_acknowledged_in_both_directions(tmp_path):
     link = Link(pipe.right)
 
     link.send_line(f"HELLO {const.PROTOCOL_VERSION}")
-    assert link.recv_line(5.0) == "HOWRU"
-    link.send_line("SYNC")
-    assert link.recv_line(5.0).startswith("CONNECT ")
+    assert link.recv_line(5.0).startswith(f"HELLO {const.PROTOCOL_VERSION} HRU? ")
+    link.send_line("HRU")
 
     link.send_line("CLOSE")                       # this end closes first
     assert link.recv_line(5.0) == "BYE"           # acknowledged
@@ -95,10 +94,9 @@ def test_the_sender_may_half_close_and_still_finish_the_file(tmp_path):
     def sender():
         from pcutp.crc import crc32_hex
 
-        peer.recv_line(5.0)                       # HELLO
-        peer.send_line("HOWRU")
-        peer.recv_line(5.0)                       # SYNC
-        peer.send_line("CONNECT 115200 MAXBLK=64")
+        peer.recv_line(5.0)                       # HELLO + capabilities
+        peer.send_line("HELLO PCUTP/2 HRU? BAUD=115200 MAXBLK=64")
+        peer.recv_line(5.0)                       # HRU
         peer.recv_line(5.0)                       # GET
         peer.send_line(
             f"META H.BIN {len(payload)} 64 {len(blocks)} {crc32_hex(payload)}"
