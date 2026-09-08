@@ -8,6 +8,21 @@ Internet -> HTTP/HTTPS -> uConsole (gateway / sender) -> UART -> PicoCalc (recei
 
 この文書は `pcutp-v2` の現行実装を規範とする。パッケージ版は 2.1.0、ワイヤ上の版は **`PCUTP/2`** である。v0.1 の凍結仕様は [PCUTP-0.1.md](PCUTP-0.1.md) に残す。
 
+## v0.1との比較
+
+| 項目 | PCUTP/1 | PCUTP/2 |
+|---|---|---|
+| 接続 | `HELLO` / `OK` の2段階 | HELLO、HRU?、HRUの3-way handshake |
+| 転送 | stop-and-wait | FLOW窓、累積ACK、BARRIER/RESUME |
+| 圧縮 | なし | 独立LZ4ブロックとRAW退避 |
+| 障害復旧 | ブロック単位の再送 | DROP、AYT/HERE、RST-ACK、seq 0再送 |
+| アイドル監視 | なし | 双方向BEACON/MARK、PING/PONG、AYT-OK |
+| 保存途中状態 | `.PART`のみ | `.PART`と`.PCUTP`サイドカー |
+| 切断 | 一方向の終了 | CLOSE/BYEとlingerによる両方向終了 |
+| 相手識別 | なし | 合意時のIDENTITY=1、WHO?/IAM |
+
+PCUTP/2はPCUTP/1とワイヤ互換ではない。v0.1のピアと接続する場合は、対応する旧実装を使う。
+
 ## 1. 回線とフレーミング
 
 - UART は **115200 baud、8N1、フロー制御なし**でセッション中固定する。
