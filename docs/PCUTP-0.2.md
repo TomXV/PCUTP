@@ -53,16 +53,21 @@ PicoCalc -> HRU
 
 ### ハンドシェイク図
 
-```mermaid
-sequenceDiagram
-    participant P as PicoCalc（受信側）
-    participant U as uConsole（送信側）
-    P->>U: HELLO PCUTP/2 + 受信能力
-    U->>U: 版数と能力を検査・合意値を計算
-    U-->>P: HELLO PCUTP/2 HRU? + 合意案
-    P->>P: MAXBLK / WINDOW / RXBUF を検査
-    P->>U: HRU
-    Note over P,U: CONNECTED：複数の GET を処理できる
+```text
+ PicoCalc (receiver)                              uConsole (sender)
+       |                                                 |
+       | HELLO PCUTP/2 + capabilities                    |
+       |------------------------------------------------>|
+       |                                                 | validate version
+       |                                                 | choose MAXBLK/WINDOW
+       | HELLO PCUTP/2 HRU? + proposal                   |
+       |<------------------------------------------------|
+       | validate proposal                               |
+       | HRU                                             |
+       |------------------------------------------------>|
+       |                                                 |
+       +=================== CONNECTED ==================+
+                 multiple GET requests may follow
 ```
 
 最初の応答を取りこぼした PicoCalc は `HELLO?` を最大9回追加で送れる。uConsole は同じ合意案を `OHRU PCUTP/2 ...` として返す。`PCUTP/2` 以外は `ERR VERSION` で拒否する。接続中に新しい `HELLO` を受けた場合も、ピアの再起動としてこの手順をやり直す。
@@ -129,27 +134,55 @@ PicoCalc -> OK <crc32> | FAIL FILECRC <actual-crc32>
 
 ### 転送フローチャート
 
-```mermaid
-flowchart TD
-    A[GET filename URL] --> B{名前・URLは有効？}
-    B -- いいえ --> E1[ERR FILE / ERR URL]
-    B -- はい --> C[FETCHING]
-    C --> D[HTTP/HTTPS から取得]
-    D --> E{取得成功・サイズ上限内？}
-    E -- いいえ --> E2[ERR HTTP / DNS / SIZE]
-    E -- はい --> F[META: サイズ・MTU・CRC32]
-    F --> G{保存容量・METAは有効？}
-    G -- いいえ --> E3[ERR STORAGE / PROTOCOL]
-    G -- はい --> H[READY]
-    H --> I[DATA または ZDATA を受信]
-    I --> J{CRC・順序・書込みは正常？}
-    J -- はい --> K[ACK と次のブロック]
-    K --> L{全ブロック受信？}
-    L -- いいえ --> I
-    L -- はい --> M[DONE と全体CRCを照合]
-    M --> N{全体CRC一致？}
-    N -- はい --> O[OK・PARTを最終名へ置換]
-    N -- いいえ --> P[FAIL FILECRC・PARTを保持]
+```text
+ [ GET filename URL ]
+           |
+           v
+ +--------------------+     no     +--------------------+
+ | name and URL valid? |----------->| ERR FILE / ERR URL |
+ +--------------------+             +--------------------+
+           |
+          yes
+           v
+ [ FETCHING ] --> [ HTTP/HTTPS fetch ]
+                            |
+                            v
+ +--------------------------+   no   +------------------------+
+ | fetch succeeded and fits? |------->| ERR HTTP / DNS / SIZE |
+ +--------------------------+         +------------------------+
+              |
+             yes
+              v
+ [ META: size, MTU, CRC32 ]
+              |
+              v
+ +---------------------------+ no  +------------------------+
+ | META valid and space free? |---->| ERR STORAGE / PROTOCOL |
+ +---------------------------+     +------------------------+
+              |
+             yes
+              v
+ [ READY ] --> [ DATA or ZDATA ] --> +----------------------+
+                                     | CRC, order, write OK?|
+                                     +----------------------+
+                                        | yes          | no
+                                        v              v
+                                  [ ACK / next ]  [ NAK / DROP ]
+                                        |
+                                        v
+                                +--------------------+
+                                | all blocks received?|
+                                +--------------------+
+                                  | no          | yes
+                                  +-------------+--> [ DONE / file CRC ]
+                                                        |
+                                                        v
+                                               +------------------+
+                                               | file CRC matches?|
+                                               +------------------+
+                                                  | yes       | no
+                                                  v           v
+                                      [ OK: rename PART ] [ FAIL: keep PART ]
 ```
 
 ファイル名は 64 文字以下の `A-Z a-z 0-9 . _ -` だけを許可する。パス成分は除去され、URL は `http` と `https` だけを許可する。リダイレクト数、HTTP 時間、サイズにも上限を設ける。
@@ -172,19 +205,27 @@ uConsole -> DATA 1 ...
 
 ### FLOW=1 の送信窓と復旧
 
-```mermaid
-sequenceDiagram
-    participant U as uConsole
-    participant P as PicoCalc
-    U->>P: DATA 0
-    U->>P: DATA 1（窓2）
-    P-->>U: ACK 0
-    U->>P: DATA 2
-    P-->>U: NAK 1 CRC または DROP 1 2
-    U->>U: 新規DATAを停止、窓を1へ戻す
-    U->>P: BARRIER 7
-    P-->>U: RESUME 7 1
-    U->>P: DATA 1（再送）
+```text
+ uConsole                                      PicoCalc
+     |                                             |
+     | DATA 0                                      |
+     |-------------------------------------------->|
+     | DATA 1              (window = 2)            |
+     |-------------------------------------------->|
+     |                    ACK 0                     |
+     |<---------------------------------------------|
+     | DATA 2                                      |
+     |-------------------------------------------->|
+     |          NAK 1 CRC  or  DROP 1 2             |
+     |<---------------------------------------------|
+     |                                             |
+     | stop new DATA; set window = 1                |
+     | BARRIER 7                                    |
+     |-------------------------------------------->|
+     |                    RESUME 7 1                |
+     |<---------------------------------------------|
+     | DATA 1              (retransmit)             |
+     |-------------------------------------------->|
 ```
 
 連続した順序ずれが3回に達した受信側は `RST 0` を送り、送信側は全ファイルを先頭から再送する。送信側が無応答を調べ尽くした場合は `RST 0 <token>` を送り、受信側は部分ファイルだけを捨てて `RST-ACK <token> 0` を返す。どちらもセッションを作り直さない転送ローカルな回復であり、完全再開は最大2回である。
@@ -211,18 +252,37 @@ uConsole -> MARK U P 0
 
 ### アイドル時の診断フロー
 
-```mermaid
-flowchart TD
-    A[4秒ごとに BEACON を送信] --> B{対応する MARK が来た？}
-    B -- はい --> A
-    B -- いいえ --> C[PING 0 / PING 1]
-    C --> D{対応する PONG が来た？}
-    D -- はい --> A
-    D -- いいえ --> E[AYT? 0 / AYT? 1]
-    E --> F{対応する HERE が来た？}
-    F -- はい --> G[AYT-OK を返す]
-    G --> A
-    F -- いいえ --> H[TX断またはリンク断として扱う]
+```text
+ [ send BEACON every 4 s ]
+             |
+             v
+ +-------------------------+
+ | matching MARK received? |
+ +-------------------------+
+       | yes       | no
+       |           v
+       |    [ PING 0, then PING 1 ]
+       |                 |
+       |                 v
+       |       +-------------------------+
+       |       | matching PONG received? |
+       |       +-------------------------+
+       |          | yes        | no
+       |          |            v
+       |          |    [ AYT? 0, then AYT? 1 ]
+       |          |                 |
+       |          |                 v
+       |          |       +------------------------+
+       |          |       | matching HERE received?|
+       |          |       +------------------------+
+       |          |           | yes       | no
+       |          |           v           v
+       |          |    [ AYT-OK ]   [ TX/link lost ]
+       |          |           |
+       +----------+-----------+
+                  |
+                  v
+          [ send next BEACON ]
 ```
 
 ビットは `0` と `1` を交互に使う。`MARK` が返らなければ `PING <bit>` / `PONG <bit>`、さらに `AYT?` / `HERE` へ段階的に進む。token が一致する応答だけを生存確認として受け入れる。これにより相手のビーコンが届くのに自分の MARK が戻らない場合、送信方向の異常として切り分けられる。
