@@ -108,6 +108,8 @@ def run_ports(args: argparse.Namespace) -> int:
 
 
 def run_serial(args: argparse.Namespace) -> int:
+    import serial
+
     port = resolve_port(args.port)
     transport = SerialTransport(port, args.baud)
     sound = Sound(enabled=args.sound)
@@ -130,6 +132,8 @@ def run_serial(args: argparse.Namespace) -> int:
         baud=args.baud,
         keepalive_interval=args.keepalive_interval,
         keepalive_timeout=args.keepalive_timeout,
+        keepalive_retries=args.keepalive_retries,
+        beacon_interval=args.beacon_interval,
         on_progress=None if args.quiet else console.progress,
         on_result=report,
     )
@@ -145,6 +149,22 @@ def run_serial(args: argparse.Namespace) -> int:
             except PcutpError as exc:
                 console.done(f"transfer failed: {exc}")
                 link.discard_input()
+                continue
+            except (serial.SerialException, OSError) as exc:
+                console.done(f"serial disconnected: {exc}; waiting for {port}")
+                try:
+                    transport.close()
+                except (serial.SerialException, OSError):
+                    pass
+                while True:
+                    try:
+                        transport = SerialTransport(port, args.baud)
+                        link.t = transport
+                        link.discard_input()
+                        console.done(f"serial reconnected: {port}")
+                        break
+                    except (serial.SerialException, OSError):
+                        time.sleep(1.0)
                 continue
     except KeyboardInterrupt:
         # Say goodbye rather than just vanishing. Dropping the port leaves the
@@ -332,7 +352,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument(
         "--keepalive-timeout", type=float, default=const.KEEPALIVE_TIMEOUT,
-        help="silent seconds before declaring the link lost",
+        help="minimum silent seconds before declaring the link lost",
+    )
+    serve.add_argument(
+        "--keepalive-retries", type=int, default=const.KEEPALIVE_RETRIES,
+        help="unanswered numbered PING probes before declaring the link lost",
+    )
+    serve.add_argument(
+        "--beacon-interval", type=float, default=const.BEACON_INTERVAL,
+        help="seconds between directional idle BEACON heartbeats",
     )
     serve.add_argument(
         "--sound",

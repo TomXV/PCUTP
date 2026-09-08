@@ -1,6 +1,16 @@
 """Real-time audio follows current events instead of replaying a backlog."""
 
-from pcutp.sound import FADE_FRAMES, PITCH, RATE, SILENCE, Sound, _samples
+from pcutp.sound import (
+    FADE_FRAMES,
+    MORSE,
+    MORSE_UNIT_MS,
+    PITCH,
+    RATE,
+    SILENCE,
+    Sound,
+    _morse,
+    _samples,
+)
 
 
 def test_latest_event_interrupts_long_effect(monkeypatch):
@@ -48,10 +58,24 @@ def test_every_current_control_word_has_a_distinct_pitch():
     words = {
         "HELLO", "HELLO?", "OHRU", "HRU", "GET", "FETCHING", "META", "READY",
         "DATA", "ZDATA", "ACK", "NAK", "DONE", "OK", "FAIL", "ERR", "PING", "PONG",
-        "CLOSE", "BYE", "BARRIER", "RESUME", "DROP", "RST", "AYT?", "HERE",
+        "CLOSE", "BYE", "BARRIER", "RESUME", "DROP", "RST", "AYT?", "HERE", "BEACON",
     }
     assert set(PITCH) == words
     assert len(set(PITCH.values())) == len(words)
+
+
+def test_keepalive_words_have_morse_signatures():
+    unit_bytes = int(RATE * MORSE_UNIT_MS / 1000) * 2
+    assert MORSE["BEACON"] == "-..."
+    assert MORSE["PING"] == ".--."
+    assert MORSE["PONG"] == ".--. ---"
+    assert MORSE["HELLO"] == "...."
+    assert MORSE["HRU"] == ".... .-. ..-"
+    assert MORSE["CLOSE"] == "-.-."
+    assert MORSE["BYE"] == "-..."
+    assert abs(len(_morse(700, "-...")) - 10 * unit_bytes) <= 4
+    assert abs(len(_morse(700, ".--.")) - 12 * unit_bytes) <= 4
+    assert abs(len(_morse(700, ".--. ---")) - 26 * unit_bytes) <= 12
 
 
 def test_transparent_keepalive_still_has_a_sound():
@@ -62,13 +86,27 @@ def test_transparent_keepalive_still_has_a_sound():
         def __init__(self):
             self.words = []
 
-        def line(self, line):
-            self.words.append(line.split()[0])
+        def line(self, line, direction="rx"):
+            self.words.append((line.split()[0], direction))
 
     pipe = PipePair()
     pipe.left.read_timeout = 0.001
     sound = Recorder()
     link = Link(pipe.left, sound=sound)
-    pipe.right.write(b"PING\nPONG\nREADY\n")
+    pipe.right.write(b"PING 7\nPONG 8\nREADY\n")
     assert link.recv_line(1) == "READY"
-    assert sound.words == ["PING", "PONG", "PONG", "READY"]
+    assert sound.words == [
+        ("PING", "rx"), ("PONG", "tx"), ("PONG", "rx"), ("READY", "rx")
+    ]
+
+
+def test_morse_transmit_pitch_is_higher_than_receive(monkeypatch):
+    sound = Sound(enabled=False)
+    sound.enabled = True
+    sound._morse_rx = {"HELLO": b"low"}
+    sound._morse_tx = {"HELLO": b"high"}
+    played = []
+    monkeypatch.setattr(sound, "_push", played.append)
+    sound.line("HELLO PCUTP/2", direction="rx")
+    sound.line("HELLO PCUTP/2", direction="tx")
+    assert played == [b"low", b"high"]

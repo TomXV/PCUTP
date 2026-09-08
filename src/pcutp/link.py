@@ -21,13 +21,26 @@ MAX_LINE_LEN = 512
 class KeepAlive:
     """Liveness parameters for the keep-alive mode of recv_line.
 
-    While waiting for a control line, a PING is sent after `interval`
-    seconds with no bytes received (at most once per interval), and the
-    link is declared lost after `timeout` seconds of silence.
+    While waiting for a control line, a numbered PING is sent after
+    `interval` seconds with no valid control line. Only the matching PONG
+    confirms liveness. After `retries` unanswered probes and `timeout`
+    seconds of silence, the link is declared lost.
     """
 
     interval: float
     timeout: float
+    retries: int = const.KEEPALIVE_RETRIES
+    beacon_interval: float = const.BEACON_INTERVAL
+    beacon_tx: str = "U"
+    beacon_rx: str = "P"
+
+    def __post_init__(self) -> None:
+        if (self.interval <= 0 or self.timeout <= 0 or self.retries < 1
+                or self.beacon_interval <= 0
+                or self.beacon_tx not in {"U", "P"}
+                or self.beacon_rx not in {"U", "P"}
+                or self.beacon_tx == self.beacon_rx):
+            raise ValueError("keep-alive interval, timeout and retries must be positive")
 
 
 class Link:
@@ -43,12 +56,14 @@ class Link:
         self.log = log
         self.sound = sound or Sound(enabled=False)
         self._buf = bytearray()
+        self._ping_id = 0
+        self._beacon_id = 0
 
     # -- sending ---------------------------------------------------------
     def send_line(self, line: str) -> None:
         if self.trace:
             self.log(f"TX> {line}")
-        self.sound.line(line)
+        self.sound.line(line, direction="tx")
         self.t.write(line.encode("ascii") + LF)
 
     def send_raw(self, data: bytes) -> None:
@@ -61,22 +76,24 @@ class Link:
         its block, so there's no reason to pay that twice per block."""
         if self.trace:
             self.log(f"TX> {line}")
-        self.sound.line(line)
+        self.sound.line(line, direction="tx")
         self.t.write(line.encode("ascii") + LF + data)
 
     # -- receiving -------------------------------------------------------
     def recv_line(self, timeout: float, keepalive: "KeepAlive | None" = None) -> str:
         """Read one control line.
 
-        PING/PONG are always handled transparently (a PING is answered with
-        PONG, a PONG just notes liveness) so they never surface to the
-        server/client state machine. With `keepalive` set, a PING is also
-        sent every `interval` of silence and, past `timeout` of silence,
-        LinkLostError is raised.
+        Numbered PING/PONG lines are handled transparently. A PING is answered
+        with a PONG carrying the same id. Only a PONG matching this side's
+        outstanding probe confirms liveness, so a delayed stale response
+        cannot keep a broken session alive.
         """
         deadline = time.monotonic() + timeout
         last_rx = time.monotonic()
         last_ping = time.monotonic()
+        last_beacon = time.monotonic()
+        outstanding: str | None = None
+        probes_sent = 0
         while True:
             idx = self._buf.find(LF)
             if idx >= 0:
@@ -85,37 +102,70 @@ class Link:
                 line = bytes(self._buf[:idx]).lstrip(b"\x00")
                 del self._buf[: idx + 1]
                 text = line.decode("ascii", errors="replace").strip("\r")
-                if text in ("PING", "PONG"):
+                parts = text.split()
+                is_ping = len(parts) == 2 and parts[0] == "PING" and parts[1].isdecimal()
+                is_pong = len(parts) == 2 and parts[0] == "PONG" and parts[1].isdecimal()
+                is_beacon = (len(parts) == 3 and parts[0] == "BEACON"
+                             and parts[1] in {"U", "P"} and parts[2].isdecimal())
+                if is_beacon:
+                    if self.trace:
+                        self.log(f"RX< {text}")
+                    self.sound.line(text, direction="rx")
+                    if keepalive is not None and parts[1] == keepalive.beacon_rx:
+                        last_rx = time.monotonic()
+                        outstanding = None
+                        probes_sent = 0
+                    continue
+                if is_ping or is_pong:
                     # Keep-alive lines are transparent to the protocol state
                     # machine, but they must remain visible in --trace output
                     # so an operator can tell that the link is alive.
                     if self.trace:
                         self.log(f"RX< {text}")
-                    self.sound.line(text)
-                    if text == "PING":
-                        self.send_line("PONG")
-                    last_rx = time.monotonic()
+                    self.sound.line(text, direction="rx")
+                    if is_ping:
+                        if parts[1] != outstanding:
+                            self.send_line(f"PONG {parts[1]}")
+                            last_rx = time.monotonic()
+                            probes_sent = 0
+                    elif parts[1] == outstanding:
+                        last_rx = time.monotonic()
+                        outstanding = None
+                        probes_sent = 0
                     continue
                 if self.trace:
                     self.log(f"RX< {text}")
-                self.sound.line(text)
+                self.sound.line(text, direction="rx")
                 return text
             if len(self._buf) > MAX_LINE_LEN:
                 raise ProtocolError("control line too long")
             now = time.monotonic()
             if keepalive is not None:
                 idle = now - last_rx
-                if idle >= keepalive.timeout:
+                if now - last_beacon >= keepalive.beacon_interval:
+                    self._beacon_id += 1
+                    self.send_line(
+                        f"BEACON {keepalive.beacon_tx} {self._beacon_id}"
+                    )
+                    last_beacon = now
+                if (idle >= keepalive.timeout and probes_sent >= keepalive.retries
+                        and now - last_ping >= keepalive.interval):
                     raise LinkLostError(f"no bytes received for {idle:.1f}s")
                 if idle >= keepalive.interval and now - last_ping >= keepalive.interval:
-                    self.send_line("PING")
+                    if probes_sent >= keepalive.retries:
+                        raise LinkLostError(
+                            f"no matching PONG after {probes_sent} probes"
+                        )
+                    self._ping_id += 1
+                    outstanding = str(self._ping_id)
+                    self.send_line(f"PING {outstanding}")
+                    probes_sent += 1
                     last_ping = now
             if now >= deadline:
                 raise TimeoutError_("timed out waiting for a control line")
             chunk = self.t.read(64)
             if chunk:
                 self._buf.extend(chunk)
-                last_rx = time.monotonic()
 
     # -- teardown (section 7 of docs/PCUTP-session.md) --------------------
     # CLOSE is FIN and BYE is FIN-ACK. Each direction closes on its own, so

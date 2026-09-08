@@ -122,28 +122,37 @@ v0.2 で追加された中で最も効いている 1 行である。
 
 ## 5. 維持 — キープアライブは制御層より下にいる
 
-`PING` / `PONG` は `Link.recv_line` の内側で透過的に処理され、上位のステートマシンには
+`PING n` / `PONG n` は `Link.recv_line` の内側で透過的に処理され、上位のステートマシンには
 一切見えない。
 
 ```
    server.py / client.py     ← ACK を待つコードは ACK のことだけ考えればよい
    ─────────────────────
-   link.py                   ← PING を見たら PONG を返し、上には渡さない
+   link.py                   ← PING n を見たら PONG n を返し、上には渡さない
    ─────────────────────
    transport.py
 ```
 
-これは単なる整理ではない。もし `PONG` が上位に漏れると、ブロックの `ACK` を待つ
-ループが `PONG` を「予期しない応答」として扱ってしまう。転送中に生存確認が走る以上、
-この分離は必須である。
+通常のアイドル状態では両側が4秒ごとに`BEACON U n` / `BEACON P n`を送り合う。
+ビーコンは応答不要で、方向タグが自分と同じローカルエコーを無視できる。相手方向の
+ビーコンが途絶えた場合だけPING/PONGへ移る。送信中の番号と一致するPONGだけが
+生存確認になり、遅れたPONGや自分のPINGのエコーは無視する。DATA転送中の無応答は
+`AYT? / HERE`でシーケンス位置まで確認する。
 
 | 定数 | 値 | 意味 |
 |---|---|---|
-| `KEEPALIVE_INTERVAL` | 5.0s | この時間無音なら `PING` を送る |
-| `KEEPALIVE_TIMEOUT` | 10.0s | この時間何も受信しなければ `LinkLostError` |
+| `KEEPALIVE_INTERVAL` | 5.0s | この時間無音なら番号付きPINGを送る |
+| `KEEPALIVE_RETRIES` | 3 | 応答なしで許容するPING回数 |
+| `KEEPALIVE_TIMEOUT` | 20.0s | 最低無音時間。3回送信後、約20秒でリンク喪失 |
+| `BEACON_INTERVAL` | 4.0s | アイドル中に双方向ビーコンを送る間隔 |
 
-受信側 (`PCUTP.BAS`) では、URL 入力プロンプト中も `InputAlive$` が `PING` に応答し続ける。
-ユーザーがキーを打っている間にリンクが落ちたと誤判定されないためである。
+受信側 (`PCUTP.BAS`) では、URL入力プロンプト中も `InputAlive$` が `PING n` に
+`PONG n`を返す。片方向断を検出した側はセッションを破棄し、BASICを再実行して
+HELLOから接続し直す。
+
+HELLO/HELLO?/OHRU/HRUとCLOSE/BYEもモールス風に可聴化する。各端末で送信音を高く、
+受信音を低くするため、同じ交換を聞いても発話側と受話側を区別できる。応答制御語は
+先にUARTへ書き、その後に音を鳴らす。
 
 ---
 
@@ -336,7 +345,9 @@ TCP と同じく、**片方向ずつ独立に閉じる**。`CLOSE` は「私の�
 | `PROBE_TIMEOUT` | 3.0s | HEREを待つ時間 |
 | `PROBE_RETRIES` | 10 | AYT?の最大送信回数 |
 | `KEEPALIVE_INTERVAL` | 5.0s | — |
-| `KEEPALIVE_TIMEOUT` | 10.0s | `KATMO` (15s) |
+| `KEEPALIVE_RETRIES` | 3 | — |
+| `KEEPALIVE_TIMEOUT` | 20.0s | `KATMO` (15s、PING受信ごとに更新) |
+| `BEACON_INTERVAL` | 4.0s | `BEACONMS` (4s) |
 | `HTTP_TIMEOUT` | 30.0s | — |
 | `FETCH_TIMEOUT` | 45.0s | `FETTMO` |
 | `MAX_RETRIES` | 5 | — |

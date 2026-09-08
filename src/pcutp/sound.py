@@ -58,6 +58,7 @@ PITCH = {
     "HRU": 466,
     "PING": 740,
     "PONG": 831,
+    "BEACON": 622,
 }
 # Keep-alive words are audible too, so the entire wire vocabulary is covered.
 
@@ -66,6 +67,20 @@ BLIP_MS = 12
 # DATA and ACK fire once per block, so they stay short; SYNC is a single
 # confirmation blip mid-handshake.
 SHORT = {"DATA", "ZDATA", "ACK", "HRU", "PING", "PONG"}
+
+# Morse-like session signatures. Transmit uses twice the receive pitch.
+MORSE = {
+    "BEACON": "-...",       # B
+    "PING": ".--.",         # P
+    "PONG": ".--. ---",    # PO
+    "HELLO": "....",        # H
+    "HELLO?": "..--..",    # ?
+    "OHRU": "---",          # O
+    "HRU": ".... .-. ..-", # HRU
+    "CLOSE": "-.-.",        # C
+    "BYE": "-...",          # B
+}
+MORSE_UNIT_MS = 30
 
 # Timbre by category. Errors are a square wave so they cut through; the
 # per-block pair is a triangle, softer across sixteen or more repeats.
@@ -150,6 +165,21 @@ def _triangle(hz: int, ms: int) -> bytes:
     return _pcm(_triangle_frames(hz, ms))
 
 
+def _morse(hz: int, pattern: str, unit_ms: int = MORSE_UNIT_MS) -> bytes:
+    """Render dots, dashes and Morse letter gaps into one nonblocking event."""
+    frames: list[float] = []
+    unit = int(RATE * unit_ms / 1000)
+    for mark in pattern:
+        if mark == " ":
+            # Every mark already contributes one silent unit, so two more make
+            # the standard three-unit gap between letters.
+            frames.extend([0.0] * (2 * unit))
+            continue
+        frames.extend(_sine_frames(hz, unit_ms * (3 if mark == "-" else 1)))
+        frames.extend([0.0] * unit)
+    return _pcm(frames)
+
+
 def _sweep(lo: int, hi: int, ms: int) -> bytes:
     """A glide between two pitches - rising to dial out, falling to hang up."""
     n = int(RATE * ms / 1000)
@@ -226,6 +256,8 @@ class Sound:
         self.rendered_events = 0
         self.max_render_delay_ms = 0.0
         self._pcm: dict[str, bytes] = {}
+        self._morse_rx: dict[str, bytes] = {}
+        self._morse_tx: dict[str, bytes] = {}
         self._alt: dict[str, tuple[bytes, bytes]] = {}
         self._blip = 0
         self._net: dict[str, bytes] = {}
@@ -262,6 +294,12 @@ class Sound:
                 self._pcm[word] = _triangle(hz, length)
             else:
                 self._pcm[word] = _samples(hz, length)
+        self._morse_rx = {
+            word: _morse(PITCH[word], pattern) for word, pattern in MORSE.items()
+        }
+        self._morse_tx = {
+            word: _morse(PITCH[word] * 2, pattern) for word, pattern in MORSE.items()
+        }
         # Two close pitches for the per-block pair, alternated in `line`.
         self._alt = {
             word: (_triangle(hz, BLIP_MS), _triangle(int(hz * DETUNE), BLIP_MS))
@@ -335,12 +373,19 @@ class Sound:
             chunk = struct.pack(f"<{CHUNK_FRAMES}h", *mixed, *new[FADE_FRAMES:])
         return chunk
 
-    def line(self, text: str) -> None:
+    def line(self, text: str, direction: str = "rx") -> None:
         """Voice a control line, keyed off its first word. A dict lookup and a
-        timestamp replacement - no synthesis or waiting for playback."""
+        timestamp replacement - no synthesis or waiting for playback.
+
+        Session/Morse words use a low receive pitch and a high transmit pitch.
+        """
         if not self.enabled:
             return
         word = text.split(" ", 1)[0] if text else ""
+        morse = self._morse_tx if direction == "tx" else self._morse_rx
+        if word in morse:
+            self._push(morse[word])
+            return
         alt = self._alt.get(word)
         if alt is not None:
             self._push(alt[self._blip & 1])

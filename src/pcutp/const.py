@@ -38,7 +38,9 @@ CLOSE_RETRIES = 3        # attempts before giving up and dropping the link
 LINGER_TIME = 2.0
 
 KEEPALIVE_INTERVAL = 5.0   # idle seconds before sending a PING probe
-KEEPALIVE_TIMEOUT = 10.0   # silent seconds before declaring the link lost
+KEEPALIVE_RETRIES = 3      # numbered probes before declaring the link lost
+KEEPALIVE_TIMEOUT = 20.0   # 3 probes at 5, 10, 15s; fail at about 20s
+BEACON_INTERVAL = 4.0      # bidirectional idle heartbeat; PING is the fallback
 CONNECT_DELAY = 0.4        # retained API setting; handshake audio pacing only
 HANDSHAKE_TIMEOUT = 10.0   # wait for HELLO HRU? / OHRU / HRU
 HELLO_RETRIES = 10         # first HELLO plus nine HELLO? retries

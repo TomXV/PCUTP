@@ -37,6 +37,7 @@ Const RESET_MAX = 2           ' full-file restarts before aborting
 ' blocks at faster rates, so the port stays open at BASEBAUD for the session.
 Const BASEBAUD  = 115200
 Const KATMO     = 15000       ' ms of receive silence before the link is lost
+Const BEACONMS  = 4000        ' bidirectional idle heartbeat interval
 ' Nothing arrives while the uConsole is on the internet, so the link-loss
 ' timer would fire on a healthy link. FETCHING announces that gap and this
 ' wider window covers it. INVARIANT: FETTMO > the uConsole's HTTP_TIMEOUT
@@ -65,6 +66,9 @@ Const HZ_RX_DATA  = 659       ' <- DATA (once per block)
 Const HZ_RX_DONE  = 784       ' <- DONE
 Const HZ_RX_ERR   = 175       ' <- ERR
 Const HZ_RX_AYT   = 698       ' <- AYT? liveness probe
+Const HZ_RX_PING  = 740       ' <- numbered idle liveness probe
+Const HZ_RX_BEACON = 622      ' <- uConsole idle heartbeat
+Const HZ_RX_SESSION = 523     ' <- HELLO/OHRU/HRU/CLOSE/BYE Morse
 
 Const HZ_TX_HELLO = 1047      ' -> HELLO
 Const HZ_TX_GET   = 1175      ' -> GET
@@ -74,6 +78,9 @@ Const HZ_TX_NAK   = 294       ' -> NAK
 Const HZ_TX_OK    = 1760      ' -> OK
 Const HZ_TX_FAIL  = 220       ' -> FAIL / ERR
 Const HZ_TX_HERE  = 1760      ' -> HERE with next expected sequence
+Const HZ_TX_PONG  = 1661      ' -> matching idle liveness response
+Const HZ_TX_BEACON = 1245     ' -> PicoCalc idle heartbeat
+Const HZ_TX_SESSION = 1047    ' -> HELLO/HRU/CLOSE/BYE Morse
 Const HZ_CLOSE    = 196       ' -> CLOSE (graceful hangup, low falling note)
 Const HZ_BYE      = 262       ' <- BYE   (the close is acknowledged)
 
@@ -86,6 +93,7 @@ Const HZ_CONNECT  = 659       ' <- connected flourish (CONNECT)
 
 Const MS_WORD     = 120       ' long enough for the PicoCalc speaker to be audible
 Const MS_BLIP     = 45        ' distinct DATA/ACK notes within the ~150 ms block cycle
+Const MORSE_UNIT  = 30        ' dot length; dash=3 units, letter gap=3 units
 Const MS_DIAL     = 260       ' the dial tone, longer than a word
 
 ' RENAME refuses a path on a drive other than the current one, even when
@@ -107,6 +115,7 @@ Dim peerDone                  ' the uConsole has closed its half of the session
 Dim flowOn, winsz             ' optional bounded-window extension
 Dim zipOn, rawlen, zipped
 Dim lastProgress
+Dim beaconAt, beaconSeq
 
 BuildReflect                  ' must run after rtab%() is dimensioned
 
@@ -124,6 +133,8 @@ SetPin GP5, GP4, COM2
 Open "COM2:" + Str$(BASEBAUD) + "," + Str$(RXBUFSZ) As #1
 lastRx = Timer
 kaWin = KATMO
+beaconAt = Timer
+beaconSeq = 0
 
 Print "PCUTP v2.1"
 
@@ -133,16 +144,12 @@ Print "PCUTP v2.1"
 Print "Dialing..."
 For helloTry = 1 To HELLO_RETRIES
   Print "HELLO " + Str$(helloTry) + "/" + Str$(HELLO_RETRIES)
-  Tone1 HZ_DIAL, 80
-  Pause 100
-  Tone1 1209, 80
-  Pause 100
-  Tone1 1477, 100
-  Pause 130
   If helloTry = 1 Then
     Print #1, "HELLO " + VER$ + " FLOW=1 MAXBLK=" + Str$(BLKMAX) + " WINDOW=" + Str$(WINMAX) + " RXBUF=" + Str$(RXBUFSZ) + " LZ4=1"
+    MorseH HZ_TX_SESSION
   Else
     Print #1, "HELLO? " + VER$ + " FLOW=1 MAXBLK=" + Str$(BLKMAX) + " WINDOW=" + Str$(WINMAX) + " RXBUF=" + Str$(RXBUFSZ) + " LZ4=1"
+    MorseQ HZ_TX_SESSION
   EndIf
   ' A silent peer is expected during the initial call.  Restart the
   ' liveness clock for every attempt so KATMO does not cut off retries.
@@ -152,10 +159,8 @@ For helloTry = 1 To HELLO_RETRIES
   If helloTry < HELLO_RETRIES Then Pause 250
 Next helloTry
 If Left$(s$, 3) = "ERR" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print s$: End
-If Left$(s$, Len("HELLO " + VER$ + " HRU?")) <> "HELLO " + VER$ + " HRU?" And Left$(s$, Len("OHRU " + VER$)) <> "OHRU " + VER$ Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print " no answer tone": End
-Tone1 HZ_ANSWER, MS_WORD
+If Left$(s$, Len("HELLO " + VER$ + " HRU?")) <> "HELLO " + VER$ + " HRU?" And Left$(s$, Len("OHRU " + VER$)) <> "OHRU " + VER$ Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print " no answer tone - redialing": Pause 1000: Run
 Print "Carrier detected"
-Tone1 HZ_SYNC, MS_BLIP
 Split s$, meta$()                       ' HELLO ... HRU? ..., or retry OHRU ...
 If meta$(0) = "HELLO" And meta$(1) = VER$ And meta$(2) = "HRU?" Then
   answerAt = 3
@@ -180,8 +185,9 @@ Next i
 If Not flowOn Then winsz = 1
 If winsz < 1 Or winsz > WINMAX Then Print "Invalid WINDOW": End
 If winsz * (maxblk + 64) > RXBUFSZ Then Print "Invalid RXBUF": End
-Tone1 HZ_CONNECT, MS_WORD
 Print #1, "HRU"
+If meta$(0) = "HELLO" Then MorseH HZ_RX_SESSION Else MorseO HZ_RX_SESSION
+MorseHRU HZ_TX_SESSION
 Print "CONNECT " + Str$(BASEBAUD)
 Print "MAXBLK=" + Str$(maxblk)
 Print "WINDOW=" + Str$(winsz)
@@ -254,7 +260,7 @@ Do
     ' The uConsole half-closing: no more files after this one, but this one
     ' still finishes. Refusing here would throw away a transfer that is about
     ' to complete perfectly well.
-    If s$ = "CLOSE" Then Print #1, "BYE" : Tone1 HZ_BYE, MS_WORD : peerDone = 1 : Continue Do
+    If s$ = "CLOSE" Then Print #1, "BYE" : MorseC HZ_RX_SESSION : MorseB HZ_TX_SESSION : peerDone = 1 : Continue Do
     Split s$, meta$()                     ' DATA seq len crc
     If meta$(0) = "DONE" Then
       If seq <> blocks Then Print #1, "ERR PROTOCOL": Close #2: End
@@ -384,15 +390,15 @@ Loop
 ' uConsole until its idle timeout - an hour by default - still holding the port.
 Sub CloseSession
   Local k, t0
-  Tone1 HZ_CLOSE, MS_WORD
   ' Close this direction. A CLOSE arriving while waiting is the uConsole
   ' closing its own at the same moment; answering it and carrying on is all a
   ' simultaneous close needs, because BYE is idempotent.
   For k = 1 To CLSRTY
     Print #1, "CLOSE"
+    MorseC HZ_TX_SESSION
     s$ = RecvLine$(CLSTMO)
-    If s$ = "BYE" Then Tone1 HZ_BYE, MS_WORD : Exit For
-    If s$ = "CLOSE" Then Print #1, "BYE" : peerDone = 1
+    If s$ = "BYE" Then MorseB HZ_RX_SESSION : Exit For
+    If s$ = "CLOSE" Then Print #1, "BYE" : MorseC HZ_RX_SESSION : MorseB HZ_TX_SESSION : peerDone = 1
   Next k
 
   ' Then wait for the uConsole to close its own direction, unless it already
@@ -402,7 +408,7 @@ Sub CloseSession
     Do While Timer - t0 < CLSTMO
       s$ = RecvLine$(CLSTMO)
       If s$ = "" Then Exit Do
-      If s$ = "CLOSE" Then Print #1, "BYE" : Tone1 HZ_BYE, MS_WORD : Exit Do
+      If s$ = "CLOSE" Then Print #1, "BYE" : MorseC HZ_RX_SESSION : MorseB HZ_TX_SESSION : Exit Do
     Loop
   EndIf
 
@@ -420,7 +426,7 @@ Sub Linger
   t0 = Timer
   Do While Timer - t0 < LINGERMS
     s$ = RecvLine$(LINGERMS)
-    If s$ = "CLOSE" Then Print #1, "BYE"
+    If s$ = "CLOSE" Then Print #1, "BYE" : MorseC HZ_RX_SESSION : MorseB HZ_TX_SESSION
   Loop
 End Sub
 
@@ -522,8 +528,8 @@ End Sub
 
 ' Read one LF-terminated control line. Returns "" on timeout.
 '
-' Keep-alive is handled transparently: a PING line is answered with PONG and
-' the read continues, and a PONG is simply noted and the read continues, so
+' Keep-alive is handled transparently: PING n is answered with PONG n and
+' the read continues, and a matching response is consumed by the initiator, so
 ' neither ever surfaces to the state machine. The link is declared lost (and
 ' the program ends) if no byte at all arrives for kaWin ms - normally KATMO,
 ' widened to FETTMO around the one wait that spans a fetch.
@@ -537,13 +543,17 @@ Function RecvLine$(tmo)
       lastRx = Timer
       ch$ = Input$(1, #1)
       If ch$ = Chr$(10) Then
-        If s$ = "PING" Then
-          Print #1, "PONG"
+        If Left$(s$, 5) = "PING " And Mid$(s$, 6) = Str$(Val(Mid$(s$, 6))) Then
+          Print #1, "PONG " + Mid$(s$, 6)
+          MorseP HZ_RX_PING
+          MorseO HZ_TX_PONG
         ElseIf Left$(s$, 5) = "AYT? " Then
           Tone1 HZ_RX_AYT, MS_WORD
           Print #1, "HERE " + Mid$(s$, 6) + " " + Str$(seq)
           Tone1 HZ_TX_HERE, MS_WORD
-        ElseIf s$ <> "PONG" Then
+        ElseIf Left$(s$, 9) = "BEACON U " Then
+          MorseB HZ_RX_BEACON
+        ElseIf Left$(s$, 5) <> "PONG " Then
           RecvLine$ = s$
           Exit Function
         EndIf
@@ -555,7 +565,8 @@ Function RecvLine$(tmo)
     EndIf
     If Timer - lastRx > kaWin Then
       Print "Link lost"
-      End
+      Pause 1000
+      Run
     EndIf
     ' Absolute cap: `t` restarts on every byte, so a rate that is producing
     ' nothing but noise would otherwise hold this loop open indefinitely and
@@ -570,10 +581,10 @@ End Function
 ' while someone is still deciding what to type. MMBasic's own Input blocks
 ' outright, which is why this exists at all.
 '
-' Every received control line other than PING is DISCARDED, silently: printing
+' Every received control line other than PING n is DISCARDED, silently: printing
 ' it would scribble over the half-typed text, and there is no state machine
 ' running here to hand it to. That is safe only because the uConsole sends
-' nothing but PING to an idle receiver - if that ever changes (an unsolicited
+' nothing but PING n to an idle receiver - if that ever changes (an unsolicited
 ' ERR, a server-initiated push), this is where it goes missing.
 '
 ' Supports Backspace (Chr$(8)) and Enter (Chr$(13)); returns "" on
@@ -589,16 +600,28 @@ Function InputAlive$(prompt$)
       lastRx = Timer
       ch$ = Input$(1, #1)
       If ch$ = Chr$(10) Then
-        If u$ = "PING" Then Print #1, "PONG"
+        If Left$(u$, 5) = "PING " And Mid$(u$, 6) = Str$(Val(Mid$(u$, 6))) Then
+          Print #1, "PONG " + Mid$(u$, 6)
+          MorseP HZ_RX_PING
+          MorseO HZ_TX_PONG
+        EndIf
         If Left$(u$, 5) = "AYT? " Then Print #1, "HERE " + Mid$(u$, 6) + " " + Str$(seq)
+        If Left$(u$, 9) = "BEACON U " Then MorseB HZ_RX_BEACON
         ' The uConsole is shutting down. Answering and quitting the prompt is
         ' what turns a clean shutdown into "Disconnected" instead of the
         ' keep-alive timer reporting it as "Link lost" ten seconds later.
-        If u$ = "CLOSE" Then Print #1, "BYE" : peerDone = 1 : InputAlive$ = "" : Exit Function
+        If u$ = "CLOSE" Then Print #1, "BYE" : MorseC HZ_RX_SESSION : MorseB HZ_TX_SESSION : peerDone = 1 : InputAlive$ = "" : Exit Function
         u$ = ""
       ElseIf ch$ <> Chr$(13) Then
         If Len(u$) < 250 Then u$ = u$ + ch$ Else u$ = ""
       EndIf
+    EndIf
+
+    If Timer - beaconAt > BEACONMS Then
+      beaconSeq = beaconSeq + 1
+      Print #1, "BEACON P " + Str$(beaconSeq)
+      MorseB HZ_TX_BEACON
+      beaconAt = Timer
     EndIf
 
     ch$ = Inkey$
@@ -620,7 +643,8 @@ Function InputAlive$(prompt$)
 
     If Timer - lastRx > kaWin Then
       Print "Link lost"
-      End
+      Pause 1000
+      Run
     EndIf
   Loop
 End Function
@@ -673,6 +697,74 @@ End Sub
 
 Sub Tone1(hz, ms)
   If BEEP Then Play Tone hz, hz, ms
+End Sub
+
+' Short Morse signatures used only while idle. The wire response is sent
+' before these routines run, so their pauses never delay PONG transmission.
+Sub MorseB(hz)                 ' B: -...
+  Local i
+  Tone1 hz, 3 * MORSE_UNIT: Pause 4 * MORSE_UNIT
+  For i = 1 To 3
+    Tone1 hz, MORSE_UNIT
+    If i < 3 Then Pause 2 * MORSE_UNIT
+  Next i
+End Sub
+
+Sub MorseP(hz)                 ' P: .--.
+  Tone1 hz, MORSE_UNIT: Pause 2 * MORSE_UNIT
+  Tone1 hz, 3 * MORSE_UNIT: Pause 4 * MORSE_UNIT
+  Tone1 hz, 3 * MORSE_UNIT: Pause 4 * MORSE_UNIT
+  Tone1 hz, MORSE_UNIT
+End Sub
+
+Sub MorseO(hz)                 ' O: ---
+  Local i
+  For i = 1 To 3
+    Tone1 hz, 3 * MORSE_UNIT
+    If i < 3 Then Pause 4 * MORSE_UNIT
+  Next i
+End Sub
+
+Sub MorseH(hz)                 ' H: ....
+  Local i
+  For i = 1 To 4
+    Tone1 hz, MORSE_UNIT
+    If i < 4 Then Pause 2 * MORSE_UNIT
+  Next i
+End Sub
+
+Sub MorseQ(hz)                 ' ?: ..--..
+  Tone1 hz, MORSE_UNIT: Pause 2 * MORSE_UNIT
+  Tone1 hz, MORSE_UNIT: Pause 2 * MORSE_UNIT
+  Tone1 hz, 3 * MORSE_UNIT: Pause 4 * MORSE_UNIT
+  Tone1 hz, 3 * MORSE_UNIT: Pause 4 * MORSE_UNIT
+  Tone1 hz, MORSE_UNIT: Pause 2 * MORSE_UNIT
+  Tone1 hz, MORSE_UNIT
+End Sub
+
+Sub MorseR(hz)                 ' R: .-.
+  Tone1 hz, MORSE_UNIT: Pause 2 * MORSE_UNIT
+  Tone1 hz, 3 * MORSE_UNIT: Pause 4 * MORSE_UNIT
+  Tone1 hz, MORSE_UNIT
+End Sub
+
+Sub MorseU(hz)                 ' U: ..-
+  Tone1 hz, MORSE_UNIT: Pause 2 * MORSE_UNIT
+  Tone1 hz, MORSE_UNIT: Pause 2 * MORSE_UNIT
+  Tone1 hz, 3 * MORSE_UNIT
+End Sub
+
+Sub MorseC(hz)                 ' C: -.-.
+  Tone1 hz, 3 * MORSE_UNIT: Pause 4 * MORSE_UNIT
+  Tone1 hz, MORSE_UNIT: Pause 2 * MORSE_UNIT
+  Tone1 hz, 3 * MORSE_UNIT: Pause 4 * MORSE_UNIT
+  Tone1 hz, MORSE_UNIT
+End Sub
+
+Sub MorseHRU(hz)               ' HRU: .... .-. ..-
+  MorseH hz: Pause 3 * MORSE_UNIT
+  MorseR hz: Pause 3 * MORSE_UNIT
+  MorseU hz
 End Sub
 
 ' Both flourishes have to outlive the statements that follow them: a tone is

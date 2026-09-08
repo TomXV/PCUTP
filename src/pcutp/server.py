@@ -50,6 +50,8 @@ class PcutpServer:
         connect_delay: float = const.CONNECT_DELAY,
         keepalive_interval: float = const.KEEPALIVE_INTERVAL,
         keepalive_timeout: float = const.KEEPALIVE_TIMEOUT,
+        keepalive_retries: int = const.KEEPALIVE_RETRIES,
+        beacon_interval: float = const.BEACON_INTERVAL,
         window_size: int = MAX_WINDOW,
         compression: bool = True,
         probe_guard: float = const.PROBE_GUARD,
@@ -88,7 +90,10 @@ class PcutpServer:
         # corrupted 4096-byte blocks, so a fixed rate is the honest choice.
         self.baud = baud
         self.connect_delay = connect_delay
-        self.keepalive = KeepAlive(keepalive_interval, keepalive_timeout)
+        self.keepalive = KeepAlive(
+            keepalive_interval, keepalive_timeout, keepalive_retries,
+            beacon_interval=beacon_interval,
+        )
         # A line read but not yet consumed; serve_once takes it next time.
         self._pending: str | None = None
 

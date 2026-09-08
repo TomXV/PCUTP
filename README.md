@@ -202,6 +202,19 @@ PCUTPから見て重要なのは、
 
 Linuxなら `/dev/ttyUSB0` や `/dev/ttyACM0`、Windowsなら `COM3` のように、PCUTPから通常のシリアルポートとして扱える状態になれば利用できます。
 
+Linux/uConsoleでは、リポジトリ内のスクリプトからデーモンをscreenへ起動できます。
+
+```bash
+./scripts/pcutpd.sh             # 起動（二重起動はしない）
+./scripts/pcutpd.sh status      # 状態確認
+./scripts/pcutpd.sh restart     # 再起動
+./scripts/pcutpd.sh log         # ログを追跡
+./scripts/pcutpd.sh stop        # 停止
+```
+
+既定値は `/dev/ttyACM0`、115200 baud、WINDOW=2、BLOCK=4096、trace・sound有効。
+たとえば別ポートなら `PCUTP_PORT=/dev/ttyUSB1 ./scripts/pcutpd.sh` と指定できます。
+
 そのため、たとえば以下のような構成が考えられます。
 
 - 一般的なUSB-UARTドングル
@@ -388,8 +401,9 @@ PCUTP/2（実装v2.1）では、以下の制御語を使用します。
              OK        ファイル全体のCRC32一致
              ERR       エラー
 
-維持         PING      生存確認
-             PONG      応答
+維持         PING n    番号付きアイドル生存確認（5秒間隔、最大3回）
+             PONG n    同じ番号による応答
+             BEACON    アイドル中の双方向ハートビート（U/P方向タグ付き）
              AYT?      転送中の無応答に対する状態確認
              HERE      生存応答と次に必要なシーケンス番号
              CLOSE     正常切断
