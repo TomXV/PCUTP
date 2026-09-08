@@ -23,8 +23,8 @@ PicoCalc
 SDカード
 ```
 
-フロー制御・MTU自動選択・LZ4圧縮は [`docs/PCUTP-flow.md`](docs/PCUTP-flow.md)、
-実測結果は [`docs/PCUTP-performance.md`](docs/PCUTP-performance.md) を参照してください。
+フロー制御・MTU自動選択・LZ4圧縮、実測結果を含む現行仕様は
+[`docs/PCUTP-0.2.md`](docs/PCUTP-0.2.md) を参照してください。
 ワイヤバージョンは `PCUTP/2` です。
 
 基本転送のプロトコル仕様は [`docs/PCUTP-0.2.md`](docs/PCUTP-0.2.md) を参照してください。

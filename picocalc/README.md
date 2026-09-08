@@ -30,5 +30,5 @@ implements the same state machine and is covered by the protocol tests.
 The FLOW=1 extension advertises a 16384-byte UART receive buffer and a two-block
 window. Optional LZ4 blocks use a separate 4096-byte decode buffer. The sender
 selects each file's MTU up to the advertised 4096-byte limit. See
-[flow and compression](../docs/PCUTP-flow.md) and
-[hardware measurements](../docs/PCUTP-performance.md).
+[flow and compression](../docs/PCUTP-0.2.md) and
+[hardware measurements](../docs/PCUTP-0.2.md).

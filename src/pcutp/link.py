@@ -270,7 +270,7 @@ class Link:
             if chunk:
                 self._buf.extend(chunk)
 
-    # -- teardown (section 7 of docs/PCUTP-session.md) --------------------
+    # -- teardown (section 6 of docs/PCUTP-0.2.md) ------------------------
     # CLOSE is FIN and BYE is FIN-ACK. Each direction closes on its own, so
     # "I have nothing more to send" and "the session is over" stop being the
     # same statement - which is what lets a sender stop taking requests while

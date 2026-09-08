@@ -1,6 +1,6 @@
 ' PCUTP.BAS - PicoCalc side of PCUTP v2.1
 ' PicoMite BASIC (MMBasic 5.07+). Receives files over UART from pcutpd
-' running on the uConsole. See docs/PCUTP-flow.md for flow control and compression.
+' running on the uConsole. See docs/PCUTP-0.2.md for flow control and compression.
 '
 ' NOTE: this is the reference receiver; the Python client in src/pcutp/client.py
 ' implements the same state machine and is what CI exercises.
@@ -424,7 +424,7 @@ Do
   Print fn$
 Loop
 
-' ---- teardown (section 7 of docs/PCUTP-session.md) -------------------
+' ---- teardown (section 6 of docs/PCUTP-0.2.md) -----------------------
 ' RMB reports the in-memory state. SaveRmb writes the same transfer facts to
 ' a sidecar file so an interrupted .PART is never polluted with control data.
 Sub ReplyRmb(bit$)

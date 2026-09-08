@@ -28,7 +28,7 @@ PROBE_GUARD = 1.0        # after ACK timeout, let a 20s raw read finish first
 PROBE_TIMEOUT = 3.0      # wait for one HERE response
 PROBE_RETRIES = 10       # tolerate a manually reconnected three-wire link
 
-# Teardown (section 7 of docs/PCUTP-session.md). CLOSE is FIN, BYE is FIN-ACK,
+# Teardown (section 6 of docs/PCUTP-0.2.md). CLOSE is FIN, BYE is FIN-ACK,
 # and each direction closes independently.
 CLOSE_TIMEOUT = 3.0      # wait for BYE before resending CLOSE
 CLOSE_RETRIES = 3        # attempts before giving up and dropping the link
