@@ -25,7 +25,7 @@ def options(tokens: list[str]) -> dict[str, int]:
     values = {}
     for token in tokens:
         key, separator, value = token.partition("=")
-        if key not in {"FLOW", "MAXBLK", "WINDOW", "RXBUF", "LZ4"}:
+        if key not in {"FLOW", "MAXBLK", "WINDOW", "RXBUF", "LZ4", "IDENTITY"}:
             continue
         if not separator or not value.isascii() or not value.isdecimal() or key in values:
             raise ProtocolError(f"invalid capability {token!r}")

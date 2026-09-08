@@ -171,6 +171,7 @@ class PcutpServer:
         self.flow = capabilities.get("FLOW") == 1
         self.compression = (self.flow and self.compression_enabled
                             and capabilities.get("LZ4") == 1)
+        self.identity = capabilities.get("IDENTITY") == 1
         self.window_size = 1
         extra = ""
         if self.flow:
@@ -181,6 +182,8 @@ class PcutpServer:
             extra = f" FLOW=1 WINDOW={self.window_size}"
             if self.compression:
                 extra += " LZ4=1"
+            if self.identity:
+                extra += " IDENTITY=1"
         proposal_tail = (f"{const.PROTOCOL_VERSION} BAUD={self.baud} "
                          f"MAXBLK={self.block_size}{extra}")
         proposal = (("HELLO " + const.PROTOCOL_VERSION + " HRU? "
@@ -202,6 +205,12 @@ class PcutpServer:
             self._fail(ProtocolError(f"expected HRU, got {reply!r}"))
             return False
         self.link.sound.handshake_connected()
+        if self.identity:
+            self.link.send_line("WHO? 0")
+            iam = self.link.recv_line(const.HANDSHAKE_TIMEOUT).split()
+            if len(iam) < 3 or iam[:2] != ["IAM", "0"] or not iam[2].startswith("TYPE="):
+                raise ProtocolError("invalid IAM response")
+            self.link.log("peer identity: " + " ".join(iam[2:]))
         # A fresh session restarts the idle heartbeat and probe numbering so a
         # session does not inherit the counters of the one before it. Guarded
         # with getattr so lightweight test links without the method still work.

@@ -157,10 +157,10 @@ Print "Dialing..."
 For helloTry = 1 To HELLO_RETRIES
   Print "HELLO " + Str$(helloTry) + "/" + Str$(HELLO_RETRIES)
   If helloTry = 1 Then
-    Print #1, "HELLO " + VER$ + " FLOW=1 MAXBLK=" + Str$(BLKMAX) + " WINDOW=" + Str$(WINMAX) + " RXBUF=" + Str$(RXBUFSZ) + " LZ4=1"
+    Print #1, "HELLO " + VER$ + " FLOW=1 MAXBLK=" + Str$(BLKMAX) + " WINDOW=" + Str$(WINMAX) + " RXBUF=" + Str$(RXBUFSZ) + " LZ4=1 IDENTITY=1"
     MorseH HZ_TX_SESSION
   Else
-    Print #1, "HELLO? " + VER$ + " FLOW=1 MAXBLK=" + Str$(BLKMAX) + " WINDOW=" + Str$(WINMAX) + " RXBUF=" + Str$(RXBUFSZ) + " LZ4=1"
+    Print #1, "HELLO? " + VER$ + " FLOW=1 MAXBLK=" + Str$(BLKMAX) + " WINDOW=" + Str$(WINMAX) + " RXBUF=" + Str$(RXBUFSZ) + " LZ4=1 IDENTITY=1"
     MorseQ HZ_TX_SESSION
   EndIf
   ' A silent peer is expected during the initial call.  Restart the
@@ -198,6 +198,10 @@ If Not flowOn Then winsz = 1
 If winsz < 1 Or winsz > WINMAX Then Print "Invalid WINDOW": End
 If winsz * (maxblk + 64) > RXBUFSZ Then Print "Invalid RXBUF": End
 Print #1, "HRU"
+If InStr(s$, "IDENTITY=1") Then
+  s$ = RecvLine$(HSTMO)
+  If s$ = "WHO? 0" Then Print #1, "IAM 0 TYPE=MCU NAME=PicoCalc ROLE=CLIENT VER=2.1"
+EndIf
 If meta$(0) = "HELLO" Then MorseH HZ_RX_SESSION Else MorseO HZ_RX_SESSION
 MorseHRU HZ_TX_SESSION
 Print "CONNECT " + Str$(BASEBAUD)

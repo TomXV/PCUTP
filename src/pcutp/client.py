@@ -74,7 +74,7 @@ class PcutpClient:
         offer = (
             f"{const.PROTOCOL_VERSION} FLOW=1 MAXBLK={self.max_block_size} "
             f"WINDOW={self.window_limit} RXBUF={self.receive_buffer}"
-            + (" LZ4=1" if self.compression_enabled else "")
+            + (" LZ4=1" if self.compression_enabled else "") + " IDENTITY=1"
         )
         answer = ""
         for attempt in range(const.HELLO_RETRIES):
@@ -95,6 +95,7 @@ class PcutpClient:
         maxblk = capabilities.get("MAXBLK", const.DEFAULT_BLOCK_SIZE)
         self.flow = capabilities.get("FLOW") == 1
         self.compression = self.flow and capabilities.get("LZ4") == 1
+        self.identity = capabilities.get("IDENTITY") == 1
         if self.compression and not self.compression_enabled:
             raise ProtocolError("unrequested compression")
         self.window_size = capabilities.get("WINDOW", 1) if self.flow else 1
@@ -102,6 +103,11 @@ class PcutpClient:
                 or self.window_size * (maxblk + FRAME_OVERHEAD) > self.receive_buffer):
             raise ProtocolError("sender exceeded receiver capabilities")
         self.link.send_line("HRU")
+        if self.identity:
+            who = self.link.recv_line(timeout).split()
+            if who != ["WHO?", "0"]:
+                raise ProtocolError("expected WHO? 0")
+            self.link.send_line("IAM 0 TYPE=PYTHON ROLE=CLIENT VER=2.1")
         self.peer_closing = False
         return maxblk
 
