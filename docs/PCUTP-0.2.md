@@ -25,6 +25,20 @@ ZDATA <sequence> <compressed-length> <raw-length> <raw-crc32> LF
 <compressed-length bytes of an independent LZ4 block>
 ```
 
+### DATA パケットフレーム
+
+```text
+ASCII 制御ヘッダ（LFまで）                RAW ペイロード（宣言された長さだけ）
+┌──────┬────┬─────┬────┬────────┬────┬────────┬────┐ ┌─────────────────────┐
+│ DATA │ SP │ seq │ SP │ length │ SP │ CRC-32 │ LF │ │ 0x00 ～ 0xFF        │
+└──────┴────┴─────┴────┴────────┴────┴────────┴────┘ └─────────────────────┘
+  4 B    1 B  可変  1 B    可変    1 B    8 B    1 B          length B
+
+例: DATA 12 4096 4A91F33C\n <続けて4096 bytes>
+```
+
+ヘッダを LF まで読んだら、受信側は `length` bytes をそのまま読む。その間の `0x0A`、`0x00`、`0xFF` は区切りや制御語ではなく、すべてファイル本体である。
+
 CRC は CRC-32/ISO-HDLC を使用し、ワイヤ上では大文字8桁の16進数で表す。
 
 ## 2. セッション確立と能力交渉
@@ -35,6 +49,20 @@ PicoCalc が起呼側、uConsole が応答側である。最初の `HELLO` は�
 PicoCalc -> HELLO PCUTP/2 FLOW=1 MAXBLK=4096 WINDOW=2 RXBUF=16384 LZ4=1
 uConsole -> HELLO PCUTP/2 HRU? BAUD=115200 MAXBLK=4096 FLOW=1 WINDOW=2 LZ4=1
 PicoCalc -> HRU
+```
+
+### ハンドシェイク図
+
+```mermaid
+sequenceDiagram
+    participant P as PicoCalc（受信側）
+    participant U as uConsole（送信側）
+    P->>U: HELLO PCUTP/2 + 受信能力
+    U->>U: 版数と能力を検査・合意値を計算
+    U-->>P: HELLO PCUTP/2 HRU? + 合意案
+    P->>P: MAXBLK / WINDOW / RXBUF を検査
+    P->>U: HRU
+    Note over P,U: CONNECTED：複数の GET を処理できる
 ```
 
 最初の応答を取りこぼした PicoCalc は `HELLO?` を最大9回追加で送れる。uConsole は同じ合意案を `OHRU PCUTP/2 ...` として返す。`PCUTP/2` 以外は `ERR VERSION` で拒否する。接続中に新しい `HELLO` を受けた場合も、ピアの再起動としてこの手順をやり直す。
@@ -99,6 +127,31 @@ uConsole -> DONE <crc32>
 PicoCalc -> OK <crc32> | FAIL FILECRC <actual-crc32>
 ```
 
+### 転送フローチャート
+
+```mermaid
+flowchart TD
+    A[GET filename URL] --> B{名前・URLは有効？}
+    B -- いいえ --> E1[ERR FILE / ERR URL]
+    B -- はい --> C[FETCHING]
+    C --> D[HTTP/HTTPS から取得]
+    D --> E{取得成功・サイズ上限内？}
+    E -- いいえ --> E2[ERR HTTP / DNS / SIZE]
+    E -- はい --> F[META: サイズ・MTU・CRC32]
+    F --> G{保存容量・METAは有効？}
+    G -- いいえ --> E3[ERR STORAGE / PROTOCOL]
+    G -- はい --> H[READY]
+    H --> I[DATA または ZDATA を受信]
+    I --> J{CRC・順序・書込みは正常？}
+    J -- はい --> K[ACK と次のブロック]
+    K --> L{全ブロック受信？}
+    L -- いいえ --> I
+    L -- はい --> M[DONE と全体CRCを照合]
+    M --> N{全体CRC一致？}
+    N -- はい --> O[OK・PARTを最終名へ置換]
+    N -- いいえ --> P[FAIL FILECRC・PARTを保持]
+```
+
 ファイル名は 64 文字以下の `A-Z a-z 0-9 . _ -` だけを許可する。パス成分は除去され、URL は `http` と `https` だけを許可する。リダイレクト数、HTTP 時間、サイズにも上限を設ける。
 
 `FETCHING` は GET の受理後、HTTP 取得前に送る。「相手は生きているが、取得中は UART が無音になる」という宣言である。受信側はこれを受けると `META` の待機を `FETCH_TIMEOUT`（45秒）まで広げる。`FETCHING` を送らない旧実装とも、直後に `META` を受けることで互換となる。
@@ -115,6 +168,23 @@ CRC 不一致は `NAK <expected> CRC`、順序ずれは `DROP <expected> <receiv
 uConsole -> BARRIER 7
 PicoCalc -> RESUME 7 1
 uConsole -> DATA 1 ...
+```
+
+### FLOW=1 の送信窓と復旧
+
+```mermaid
+sequenceDiagram
+    participant U as uConsole
+    participant P as PicoCalc
+    U->>P: DATA 0
+    U->>P: DATA 1（窓2）
+    P-->>U: ACK 0
+    U->>P: DATA 2
+    P-->>U: NAK 1 CRC または DROP 1 2
+    U->>U: 新規DATAを停止、窓を1へ戻す
+    U->>P: BARRIER 7
+    P-->>U: RESUME 7 1
+    U->>P: DATA 1（再送）
 ```
 
 連続した順序ずれが3回に達した受信側は `RST 0` を送り、送信側は全ファイルを先頭から再送する。送信側が無応答を調べ尽くした場合は `RST 0 <token>` を送り、受信側は部分ファイルだけを捨てて `RST-ACK <token> 0` を返す。どちらもセッションを作り直さない転送ローカルな回復であり、完全再開は最大2回である。
@@ -137,6 +207,22 @@ PicoCalc -> MARK P U 0
 
 PicoCalc -> BEACON P 0
 uConsole -> MARK U P 0
+```
+
+### アイドル時の診断フロー
+
+```mermaid
+flowchart TD
+    A[4秒ごとに BEACON を送信] --> B{対応する MARK が来た？}
+    B -- はい --> A
+    B -- いいえ --> C[PING 0 / PING 1]
+    C --> D{対応する PONG が来た？}
+    D -- はい --> A
+    D -- いいえ --> E[AYT? 0 / AYT? 1]
+    E --> F{対応する HERE が来た？}
+    F -- はい --> G[AYT-OK を返す]
+    G --> A
+    F -- いいえ --> H[TX断またはリンク断として扱う]
 ```
 
 ビットは `0` と `1` を交互に使う。`MARK` が返らなければ `PING <bit>` / `PONG <bit>`、さらに `AYT?` / `HERE` へ段階的に進む。token が一致する応答だけを生存確認として受け入れる。これにより相手のビーコンが届くのに自分の MARK が戻らない場合、送信方向の異常として切り分けられる。
