@@ -76,7 +76,7 @@ stop() {
 
 usage() {
   cat <<'EOF'
-Usage: scripts/pcutpd.sh [start|restart|stop|status|log|help] [daemon options]
+Usage: scripts/pcutpd.sh [start|restart|stop|status|log|rmb|help] [daemon options]
 
 With no action, `start` is used. A running screen session is never duplicated.
 Extra options after start/restart are passed to `pcutp.daemon serve`.
@@ -95,6 +95,7 @@ Examples:
   ./scripts/pcutpd.sh restart
   PCUTP_PORT=/dev/ttyUSB1 ./scripts/pcutpd.sh start --quiet
   ./scripts/pcutpd.sh log
+  ./scripts/pcutpd.sh rmb
 EOF
 }
 
@@ -108,6 +109,7 @@ case "$action" in
   stop) stop ;;
   status) status ;;
   log) touch "$log_file"; tail -f "$log_file" ;;
+  rmb) PYTHONPATH="$repo_dir/src" "$python_bin" "$repo_dir/scripts/pcutpctl.py" rmb ;;
   help|-h|--help) usage ;;
   *) printf 'unknown action: %s\n' "$action" >&2; usage >&2; exit 2 ;;
 esac

@@ -56,8 +56,23 @@ class Link:
         self.log = log
         self.sound = sound or Sound(enabled=False)
         self._buf = bytearray()
-        self._ping_id = 0
-        self._beacon_id = 0
+        self._ping_bit = 0
+        self._ayt_bit = 0
+        self._beacon_bit = 0
+        self._peer_beacon_bit = 0
+
+    def reset_session(self) -> None:
+        """Restart the idle heartbeat and probe counters for a fresh session.
+
+        A Link lives for the whole daemon lifetime and spans many sessions, so
+        without this the PING values climb forever.  Beacons deliberately use
+        a one-bit alternating value, so the peer can see fresh traffic without
+        an unbounded counter.
+        """
+        self._ping_bit = 0
+        self._ayt_bit = 0
+        self._beacon_bit = 0
+        self._peer_beacon_bit = 0
 
     # -- sending ---------------------------------------------------------
     def send_line(self, line: str) -> None:
@@ -80,7 +95,8 @@ class Link:
         self.t.write(line.encode("ascii") + LF + data)
 
     # -- receiving -------------------------------------------------------
-    def recv_line(self, timeout: float, keepalive: "KeepAlive | None" = None) -> str:
+    def recv_line(self, timeout: float, keepalive: "KeepAlive | None" = None,
+                  on_idle: "Callable[[], None] | None" = None) -> str:
         """Read one control line.
 
         Numbered PING/PONG lines are handled transparently. A PING is answered
@@ -94,7 +110,12 @@ class Link:
         last_beacon = time.monotonic()
         outstanding: str | None = None
         probes_sent = 0
+        beacon_waiting: int | None = None
+        last_beacon_mark = time.monotonic()
+        marker_probes = 0
         while True:
+            if on_idle is not None:
+                on_idle()
             idx = self._buf.find(LF)
             if idx >= 0:
                 # Some UARTs (e.g. right after the PicoCalc opens COM2) emit
@@ -105,9 +126,14 @@ class Link:
                 parts = text.split()
                 is_ping = len(parts) == 2 and parts[0] == "PING" and parts[1].isdecimal()
                 is_pong = len(parts) == 2 and parts[0] == "PONG" and parts[1].isdecimal()
+                is_here = (len(parts) == 3 and parts[0] == "HERE"
+                           and parts[1] in {"0", "1"} and parts[2].isdecimal())
                 is_beacon = (len(parts) == 3 and parts[0] == "BEACON"
-                             and parts[1] in {"U", "P"} and parts[2].isdecimal())
-                if is_beacon:
+                             and parts[1] in {"U", "P"} and parts[2] in {"0", "1"})
+                is_marker = (len(parts) == 4 and parts[0] == "MARK"
+                             and parts[1] in {"U", "P"} and parts[2] in {"U", "P"}
+                             and parts[3] in {"0", "1"})
+                if is_beacon or is_marker:
                     if self.trace:
                         self.log(f"RX< {text}")
                     self.sound.line(text, direction="rx")
@@ -115,8 +141,35 @@ class Link:
                         last_rx = time.monotonic()
                         outstanding = None
                         probes_sent = 0
+                        if is_marker:
+                            # MARK P U 0 means the PicoCalc actually received
+                            # our BEACON U 0.  Only this proves TX is intact.
+                            marked_direction, bit = parts[2], int(parts[3])
+                            if marked_direction == keepalive.beacon_tx and bit == beacon_waiting:
+                                beacon_waiting = None
+                                last_beacon_mark = time.monotonic()
+                        else:
+                            bit = int(parts[2])
+                            if bit == self._peer_beacon_bit:
+                                self._peer_beacon_bit ^= 1
+                            else:
+                                self.log(
+                                    "beacon phase mismatch: expected "
+                                    f"{keepalive.beacon_rx} {self._peer_beacon_bit}, "
+                                    f"got {keepalive.beacon_rx} {bit}"
+                                )
+                                # A duplicated/lost marker must not leave
+                                # the two idle loops permanently one phase
+                                # apart. Accept the observed phase and make
+                                # the next expected bit its complement.
+                                self._peer_beacon_bit = bit ^ 1
+                            # A marker is both visible synchronisation evidence
+                            # and a receipt for the peer's transmit direction.
+                            self.send_line(
+                                f"MARK {keepalive.beacon_tx} {keepalive.beacon_rx} {bit}"
+                            )
                     continue
-                if is_ping or is_pong:
+                if is_ping or is_pong or is_here:
                     # Keep-alive lines are transparent to the protocol state
                     # machine, but they must remain visible in --trace output
                     # so an operator can tell that the link is alive.
@@ -128,10 +181,36 @@ class Link:
                             self.send_line(f"PONG {parts[1]}")
                             last_rx = time.monotonic()
                             probes_sent = 0
-                    elif parts[1] == outstanding:
+                    elif is_pong and parts[1] == outstanding:
                         last_rx = time.monotonic()
                         outstanding = None
                         probes_sent = 0
+                        # A matching PONG also proves our transmit direction.
+                        beacon_waiting = None
+                        last_beacon_mark = last_rx
+                        marker_probes = 0
+                        # Each diagnosis is a fixed 0 -> 1 conversation.
+                        # A successful first PONG must not make the next
+                        # fault begin at 1 and then wrap around to 0.
+                        self._ping_bit = 0
+                        self._ayt_bit = 0
+                        self._beacon_bit = 0
+                        last_beacon = last_rx
+                    elif is_here and parts[1] == outstanding:
+                        last_rx = time.monotonic()
+                        outstanding = None
+                        beacon_waiting = None
+                        last_beacon_mark = last_rx
+                        marker_probes = 0
+                        self._ping_bit = 0
+                        self._ayt_bit = 0
+                        self._beacon_bit = 0
+                        last_beacon = last_rx
+                        self.log(f"STILL ALIVE: {text}")
+                        # HERE proves that PicoCalc is still servicing its
+                        # prompt. Confirm receipt so its visible AYT message
+                        # is cleared after the link has recovered.
+                        self.send_line(f"AYT-OK {parts[1]}")
                     continue
                 if self.trace:
                     self.log(f"RX< {text}")
@@ -142,22 +221,46 @@ class Link:
             now = time.monotonic()
             if keepalive is not None:
                 idle = now - last_rx
-                if now - last_beacon >= keepalive.beacon_interval:
-                    self._beacon_id += 1
+                if (marker_probes == 0
+                        and now - last_beacon >= keepalive.beacon_interval):
+                    beacon_waiting = self._beacon_bit
                     self.send_line(
-                        f"BEACON {keepalive.beacon_tx} {self._beacon_id}"
+                        f"BEACON {keepalive.beacon_tx} {beacon_waiting}"
                     )
+                    self._beacon_bit ^= 1
                     last_beacon = now
+                if (beacon_waiting is not None
+                        and now - last_beacon_mark >= keepalive.interval
+                        and now - last_ping >= keepalive.interval):
+                    if marker_probes >= keepalive.retries + 1:
+                        raise LinkLostError(
+                            "TX path failed: peer BEACONs arrived but no "
+                            f"MARK/PONG/HERE for {keepalive.beacon_tx} {beacon_waiting}"
+                        )
+                    if marker_probes < 2:
+                        outstanding = str(self._ping_bit)
+                        self._ping_bit ^= 1
+                        self.send_line(f"PING {outstanding}")
+                    else:
+                        outstanding = str(self._ayt_bit)
+                        self._ayt_bit ^= 1
+                        self.log(f"STILL ALIVE? AYT? {outstanding}")
+                        self.send_line(f"AYT? {outstanding}")
+                    marker_probes += 1
+                    last_ping = now
                 if (idle >= keepalive.timeout and probes_sent >= keepalive.retries
                         and now - last_ping >= keepalive.interval):
-                    raise LinkLostError(f"no bytes received for {idle:.1f}s")
+                    raise LinkLostError(
+                        f"RX path failed or both paths failed: no bytes for {idle:.1f}s"
+                    )
                 if idle >= keepalive.interval and now - last_ping >= keepalive.interval:
                     if probes_sent >= keepalive.retries:
                         raise LinkLostError(
-                            f"no matching PONG after {probes_sent} probes"
+                            "RX path failed or both paths failed: "
+                            f"no PONG after {probes_sent} probes"
                         )
-                    self._ping_id += 1
-                    outstanding = str(self._ping_id)
+                    outstanding = str(self._ping_bit)
+                    self._ping_bit ^= 1
                     self.send_line(f"PING {outstanding}")
                     probes_sent += 1
                     last_ping = now
@@ -254,5 +357,11 @@ class Link:
 
     def discard_input(self) -> None:
         self._buf.clear()
-        while self.t.read(256):
+        try:
+            while self.t.read(256):
+                pass
+        except OSError:
+            # A dead serial port raises here; the caller is already treating
+            # the link as lost, so just give up draining rather than leak the
+            # exception out of the reconnect path.
             pass

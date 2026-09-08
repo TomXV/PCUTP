@@ -1,21 +1,61 @@
 """pcutpd: the uConsole-side daemon and a hardware-free self test."""
 
 import argparse
+import os
+import socket
 import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from . import __version__, const
 from . import sound as sound_mod
 from .client import PcutpClient
-from .errors import LinkLostError, PcutpError
+from .errors import LinkLostError, PcutpError, TimeoutError_
 from .fetcher import Fetched
 from .link import Link
 from .server import PcutpServer
 from .sound import Sound
-from .transport import PipePair, SerialTransport
+from .transport import PipePair, SerialTransport, Transport
+
+# Two consecutive link failures are treated as a pulled cable: the first
+# failure could be an unclean peer shutdown, but the second one on the same
+# still-open port is almost always the Flipper gone from the USB bus.
+LINK_LOST_THRESHOLD = 2
+RECONNECT_INTERVAL = 1.0
+RECONNECT_SETTLE = 0.2
+
+
+class ControlSocket:
+    """Local datagram control plane; it never opens or writes the UART."""
+
+    def __init__(self, path: str):
+        self.path = path
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.socket.bind(path)
+        self.socket.setblocking(False)
+
+    def commands(self) -> list[str]:
+        out = []
+        while True:
+            try:
+                data = self.socket.recv(64)
+            except BlockingIOError:
+                return out
+            out.append(data.decode("ascii", "replace").strip().upper())
+
+    def close(self) -> None:
+        self.socket.close()
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass
 
 
 class Console:
@@ -107,14 +147,76 @@ def run_ports(args: argparse.Namespace) -> int:
     return 0
 
 
+def wait_for_port(
+    port: str,
+    interval: float = RECONNECT_INTERVAL,
+    timeout: float | None = None,
+) -> bool:
+    """Poll for `port` to reappear; True once it exists, False on timeout.
+
+    The port path is fixed at startup (resolved from-by-id names vanish
+    with the device), so the presence check is a plain ``os.path.exists``.
+    None (the default) means poll forever, matching a daemon that should
+    stay up until the cable is re-plugged.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        if os.path.exists(port):
+            return True
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def reconnect(
+    transport: Transport,
+    link: Link,
+    port: str,
+    baud: int,
+    wait: "Callable[[str], bool]" = wait_for_port,
+    log: "Callable[[str], None]" = print,
+) -> SerialTransport:
+    """Wait for the port to come back, then splice a fresh transport into `link`.
+
+    The successful path: ``transport.close()``, ``wait(port)`` until the
+    device reappears, a short settle so the Flipper's post-enumeration spam
+    is flushed, then ``discard_input()`` to drop that garbage before a new
+    handshake. Returns the new SerialTransport.
+    """
+    log(f"waiting for {port}")
+    wait(port)
+    log(f"{port} present; reconnecting")
+    # The bridge emits a burst of stray bytes (seen as `q` in the logs) as
+    # soon as it comes back; a short settle plus discard stops those being
+    # read as the first control line of the next session.
+    time.sleep(RECONNECT_SETTLE)
+    new_transport = SerialTransport(port, baud)
+    link.t = new_transport
+    link.discard_input()
+    log(f"serial reconnected: {port}")
+    return new_transport
+
+
 def run_serial(args: argparse.Namespace) -> int:
-    import serial
+    from serial import SerialException
 
     port = resolve_port(args.port)
-    transport = SerialTransport(port, args.baud)
+    transport: SerialTransport = SerialTransport(port, args.baud)
     sound = Sound(enabled=args.sound)
     console = Console(show_bar=not args.quiet)
     link = Link(transport, trace=args.trace, sound=sound, log=console.log)
+    control = ControlSocket(args.control_socket)
+    control_bit = 0
+
+    def control_idle() -> None:
+        nonlocal control_bit
+        for command in control.commands():
+            if command == "RMB":
+                link.send_line(f"RMB? {control_bit}")
+                console.log(f"control: RMB? {control_bit}")
+                control_bit = 1 - control_bit
+            else:
+                console.log(f"control: ignored {command!r}")
 
     def report(result) -> None:
         status = "verified" if result.verified else "CRC MISMATCH"
@@ -138,33 +240,37 @@ def run_serial(args: argparse.Namespace) -> int:
         on_result=report,
     )
     print(f"pcutpd {__version__} on {port} @ {args.baud} 8N1 (Ctrl-C to stop)")
+    lost_streak = 0
     try:
         while True:
             try:
-                server.serve_once(timeout=args.idle_timeout)
-            except LinkLostError:
-                console.done("link lost")
-                link.discard_input()
-                continue
+                server.serve_once(timeout=args.idle_timeout, on_idle=control_idle)
+                lost_streak = 0  # a clean session handshake resets the streak
+            except (SerialException, OSError):
+                # A dead port is unambiguous: the fd is gone or unreadable.
+                lost_streak = 0
+                console.done(f"serial disconnected on {port}; waiting for the cable")
+                transport.close()
+                transport = reconnect(
+                    transport, link, port, args.baud, log=console.done
+                )
+            except (LinkLostError, TimeoutError_) as exc:
+                lost_streak += 1
+                console.done(f"link lost ({exc.code}): {exc}")
+                if lost_streak < LINK_LOST_THRESHOLD:
+                    # The first loss can be an unclean peer shutdown (Ctrl-C
+                    # mid-session), not a pulled cable. Give the same port one
+                    # more chance before assuming a physical disconnect.
+                    link.discard_input()
+                    continue
+                console.done("detected disconnect; waiting for the port")
+                transport.close()
+                transport = reconnect(
+                    transport, link, port, args.baud, log=console.done
+                )
             except PcutpError as exc:
                 console.done(f"transfer failed: {exc}")
                 link.discard_input()
-                continue
-            except (serial.SerialException, OSError) as exc:
-                console.done(f"serial disconnected: {exc}; waiting for {port}")
-                try:
-                    transport.close()
-                except (serial.SerialException, OSError):
-                    pass
-                while True:
-                    try:
-                        transport = SerialTransport(port, args.baud)
-                        link.t = transport
-                        link.discard_input()
-                        console.done(f"serial reconnected: {port}")
-                        break
-                    except (serial.SerialException, OSError):
-                        time.sleep(1.0)
                 continue
     except KeyboardInterrupt:
         # Say goodbye rather than just vanishing. Dropping the port leaves the
@@ -181,6 +287,7 @@ def run_serial(args: argparse.Namespace) -> int:
         return 0
     finally:
         sound.close()
+        control.close()
         transport.close()
 
 
@@ -346,6 +453,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum unacknowledged blocks (limited by receiver capabilities)",
     )
     serve.add_argument("--idle-timeout", type=float, default=3600.0)
+    serve.add_argument(
+        "--control-socket", default="/tmp/pcutpd.sock",
+        help="local datagram socket for pcutpctl commands",
+    )
     serve.add_argument(
         "--keepalive-interval", type=float, default=const.KEEPALIVE_INTERVAL,
         help="idle seconds before sending a PING probe",

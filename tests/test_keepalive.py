@@ -24,7 +24,10 @@ def _read_raw_line(end, timeout: float = 1.0) -> bytes:
             return bytes(buf[:idx])
         if time.monotonic() >= deadline:
             return bytes(buf)
-        chunk = end.read(64)
+        # Read one byte so a second diagnostic line is not consumed and lost
+        # after the first LF. PipeEnd can otherwise return several lines at
+        # once, while this helper intentionally returns only the first.
+        chunk = end.read(1)
         if chunk:
             buf.extend(chunk)
 
@@ -78,7 +81,7 @@ def test_keepalive_sends_three_numbered_probes_before_link_loss():
     probes = [_read_raw_line(pipe.right) for _ in range(3)]
     thread.join(1)
 
-    assert probes == [b"PING 1", b"PING 2", b"PING 3"]
+    assert probes == [b"PING 0", b"PING 1", b"PING 0"]
     assert isinstance(outcome[0], LinkLostError)
 
 
@@ -96,10 +99,10 @@ def test_stale_pong_does_not_confirm_latest_probe():
 
     thread = threading.Thread(target=target)
     thread.start()
+    assert _read_raw_line(pipe.right) == b"PING 0"
+    pipe.right.write(b"PONG 1\n")
     assert _read_raw_line(pipe.right) == b"PING 1"
-    pipe.right.write(b"PONG 0\n")
-    assert _read_raw_line(pipe.right) == b"PING 2"
-    assert _read_raw_line(pipe.right) == b"PING 3"
+    assert _read_raw_line(pipe.right) == b"PING 0"
     thread.join(1)
 
     assert isinstance(outcome[0], LinkLostError)
@@ -126,7 +129,7 @@ def test_echoed_ping_does_not_keep_the_sender_alive():
         pipe.right.write(probe + b"\n")  # Flipper bridge local echo
     thread.join(1)
 
-    assert probes == [b"PING 1", b"PING 2", b"PING 3"]
+    assert probes == [b"PING 0", b"PING 1", b"PING 0"]
     assert isinstance(outcome[0], LinkLostError)
 
 
@@ -141,13 +144,87 @@ def test_directional_beacon_is_liveness_but_local_echo_is_not():
         target=lambda: received.append(link.recv_line(1.0, keepalive=keepalive))
     )
     thread.start()
+    assert _read_raw_line(pipe.right) == b"BEACON U 0"
+    pipe.right.write(b"BEACON U 0\n")  # Flipper/local echo: ignored
+    pipe.right.write(b"BEACON P 0\nMARK P U 0\n")  # peer beacon plus receipt marker
+    assert _read_raw_line(pipe.right) == b"MARK U P 0"
     assert _read_raw_line(pipe.right) == b"BEACON U 1"
-    pipe.right.write(b"BEACON U 1\n")  # Flipper/local echo: ignored
-    pipe.right.write(b"BEACON P 7\n")  # peer direction: valid liveness
+    pipe.right.write(b"BEACON P 1\nMARK P U 1\n")
     pipe.right.write(b"GET B.BIN https://example.com/b\n")
     thread.join(1)
 
     assert received == ["GET B.BIN https://example.com/b"]
+
+
+def test_beacon_phase_mismatch_requests_a_marker_and_recovers():
+    pipe = PipePair()
+    pipe.left.read_timeout = pipe.right.read_timeout = 0.005
+    link = Link(pipe.left)
+    received = []
+    keepalive = KeepAlive(0.5, 1.0, beacon_interval=0.02)
+
+    thread = threading.Thread(
+        target=lambda: received.append(link.recv_line(1.0, keepalive=keepalive))
+    )
+    thread.start()
+    assert _read_raw_line(pipe.right) == b"BEACON U 0"
+    pipe.right.write(b"BEACON P 1\n")  # expected P 0: phase is wrong
+    assert _read_raw_line(pipe.right) == b"MARK U P 1"
+    pipe.right.write(b"MARK P U 0\n")  # receipt for the local beacon
+    pipe.right.write(b"GET B.BIN https://example.com/b\n")
+    thread.join(1)
+
+    assert received == ["GET B.BIN https://example.com/b"]
+
+
+def test_peer_marker_confirms_our_beacon():
+    pipe = PipePair()
+    pipe.left.read_timeout = pipe.right.read_timeout = 0.005
+    link = Link(pipe.left)
+    received = []
+    keepalive = KeepAlive(0.05, 0.2, beacon_interval=0.02)
+
+    thread = threading.Thread(
+        target=lambda: received.append(link.recv_line(1.0, keepalive=keepalive))
+    )
+    thread.start()
+    assert _read_raw_line(pipe.right) == b"BEACON U 0"
+    pipe.right.write(b"MARK P U 0\n")
+    pipe.right.write(b"GET B.BIN https://example.com/b\n")
+    thread.join(1)
+
+    assert received == ["GET B.BIN https://example.com/b"]
+
+
+def test_missing_beacon_marker_probes_then_detects_transmit_only_break():
+    pipe = PipePair()
+    pipe.left.read_timeout = pipe.right.read_timeout = 0.005
+    trace = []
+    link = Link(pipe.left, trace=True, log=trace.append)
+    outcome = []
+    keepalive = KeepAlive(0.02, 0.2, retries=3, beacon_interval=0.02)
+
+    def target():
+        try:
+            link.recv_line(1.0, keepalive=keepalive)
+        except LinkLostError as exc:
+            outcome.append(exc)
+
+    thread = threading.Thread(target=target)
+    thread.start()
+    thread.join(1)
+
+    assert [line for line in trace if line.startswith("TX> PING ")] == [
+        "TX> PING 0", "TX> PING 1"
+    ]
+    assert [line for line in trace if line.startswith("TX> AYT? ")] == [
+        "TX> AYT? 0", "TX> AYT? 1"
+    ]
+    assert [line for line in trace if line.startswith("TX> BEACON ")] == [
+        "TX> BEACON U 0"
+    ]
+    assert isinstance(outcome[0], LinkLostError)
+    assert "TX path failed" in str(outcome[0])
 
 
 def test_matching_pong_resets_probe_failures():
@@ -162,13 +239,72 @@ def test_matching_pong_resets_probe_failures():
         )
     )
     thread.start()
-    assert _read_raw_line(pipe.right) == b"PING 1"
-    pipe.right.write(b"PONG 1\n")
-    assert _read_raw_line(pipe.right) == b"PING 2"
-    pipe.right.write(b"PONG 2\nGET OK.BIN https://example.com/ok\n")
+    assert _read_raw_line(pipe.right) == b"PING 0"
+    pipe.right.write(b"PONG 0\n")
+    # A recovered diagnostic starts the next probe sequence at zero again.
+    assert _read_raw_line(pipe.right) == b"PING 0"
+    pipe.right.write(b"PONG 0\nGET OK.BIN https://example.com/ok\n")
     thread.join(1)
 
     assert received == ["GET OK.BIN https://example.com/ok"]
+
+
+def test_matching_here_confirms_the_ayt_display_is_cleared():
+    pipe = PipePair()
+    pipe.left.read_timeout = pipe.right.read_timeout = 0.005
+    link = Link(pipe.left)
+    received = []
+    keepalive = KeepAlive(0.1, 1.0, retries=3, beacon_interval=0.1)
+
+    thread = threading.Thread(
+        target=lambda: received.append(link.recv_line(1.0, keepalive=keepalive))
+    )
+    thread.start()
+    assert _read_raw_line(pipe.right) == b"BEACON U 0"
+    assert _read_raw_line(pipe.right) == b"PING 0"
+    assert _read_raw_line(pipe.right) == b"PING 1"
+    assert _read_raw_line(pipe.right) == b"AYT? 0"
+    pipe.right.write(b"HERE 0 25\n")
+    assert _read_raw_line(pipe.right) == b"AYT-OK 0"
+    pipe.right.write(b"GET OK.BIN https://example.com/ok\n")
+    thread.join(1)
+
+    assert received == ["GET OK.BIN https://example.com/ok"]
+
+
+def test_reset_session_restarts_beacon_and_ping_bits():
+    pipe = PipePair()
+    pipe.left.read_timeout = pipe.right.read_timeout = 0.005
+    link = Link(pipe.left)
+    received = []
+    keepalive = KeepAlive(0.05, 0.2, beacon_interval=0.02)
+
+    def expect_first_beacon_is_zero():
+        thread = threading.Thread(
+            target=lambda: received.append(link.recv_line(1.0, keepalive=keepalive))
+        )
+        thread.start()
+        assert _read_raw_line(pipe.right) == b"BEACON U 0"
+        return thread
+
+    first = expect_first_beacon_is_zero()
+    pipe.right.write(b"BEACON P 0\nMARK P U 0\n")  # liveness and outbound receipt
+    assert _read_raw_line(pipe.right) == b"MARK U P 0"
+    pipe.right.write(b"GET A.BIN https://example.com/a\n")
+    first.join(1)
+
+    # A new session must start its alternating beacon bit at zero again.
+    link.reset_session()
+    second = expect_first_beacon_is_zero()
+    pipe.right.write(b"BEACON P 0\nMARK P U 0\n")
+    assert _read_raw_line(pipe.right) == b"MARK U P 0"
+    pipe.right.write(b"GET B.BIN https://example.com/b\n")
+    second.join(1)
+
+    assert received == [
+        "GET A.BIN https://example.com/a",
+        "GET B.BIN https://example.com/b",
+    ]
 
 
 @pytest.mark.parametrize("args", [(0, 1, 1), (1, 0, 1), (1, 1, 0)])

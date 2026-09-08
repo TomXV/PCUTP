@@ -27,7 +27,7 @@ Const ACKTMO    = 15000       ' ms, allow SD writes and recovery barriers
 Const CLSTMO    = 3000        ' ms to wait for BYE before resending CLOSE
 Const CLSRTY    = 3           ' CLOSE attempts before dropping the link
 Const LINGERMS  = 2000        ' ms to keep answering a repeated CLOSE
-Const DATTMO    = 20000       ' ms, raw payload after a DATA header
+Const DATTMO    = 12000       ' ms; below ACK+probe guard so AYT is byte-safe
 Const HSTMO     = 10000       ' ms, wait for the server's HELLO HRU? proposal
 Const HELLO_RETRIES = 10      ' initial HELLO plus nine HELLO? retries
 Const DROP_MAX  = 3           ' sequence gaps before restarting the file
@@ -36,7 +36,8 @@ Const RESET_MAX = 2           ' full-file restarts before aborting
 ' the Flipper USB-UART bridge carried 115200 reliably but corrupted 4096-byte
 ' blocks at faster rates, so the port stays open at BASEBAUD for the session.
 Const BASEBAUD  = 115200
-Const KATMO     = 15000       ' ms of receive silence before the link is lost
+Const KATMO     = 30000       ' ms; idle link-loss detection
+Const RSTTMO    = 60000       ' ms; covers ACK, AYT retries, and 3 RST frames
 Const BEACONMS  = 4000        ' bidirectional idle heartbeat interval
 ' Nothing arrives while the uConsole is on the internet, so the link-loss
 ' timer would fire on a healthy link. FETCHING announces that gap and this
@@ -65,9 +66,12 @@ Const HZ_RX_META  = 587       ' <- META
 Const HZ_RX_DATA  = 659       ' <- DATA (once per block)
 Const HZ_RX_DONE  = 784       ' <- DONE
 Const HZ_RX_ERR   = 175       ' <- ERR
+Const HZ_RX_RST   = 247       ' <- RST transfer restart request
+Const HZ_RX_RMB   = 932       ' <- RMB? state query
 Const HZ_RX_AYT   = 698       ' <- AYT? liveness probe
 Const HZ_RX_PING  = 740       ' <- numbered idle liveness probe
 Const HZ_RX_BEACON = 622      ' <- uConsole idle heartbeat
+Const HZ_RX_MARK = 659        ' <- beacon phase marker
 Const HZ_RX_SESSION = 523     ' <- HELLO/OHRU/HRU/CLOSE/BYE Morse
 
 Const HZ_TX_HELLO = 1047      ' -> HELLO
@@ -77,9 +81,12 @@ Const HZ_TX_ACK   = 1568      ' -> ACK (once per block)
 Const HZ_TX_NAK   = 294       ' -> NAK
 Const HZ_TX_OK    = 1760      ' -> OK
 Const HZ_TX_FAIL  = 220       ' -> FAIL / ERR
+Const HZ_TX_RST_ACK = 277     ' -> RST-ACK transfer reset confirmation
+Const HZ_TX_RMB   = 1864      ' -> RMB state report
 Const HZ_TX_HERE  = 1760      ' -> HERE with next expected sequence
 Const HZ_TX_PONG  = 1661      ' -> matching idle liveness response
 Const HZ_TX_BEACON = 1245     ' -> PicoCalc idle heartbeat
+Const HZ_TX_MARK = 1319       ' -> beacon phase marker
 Const HZ_TX_SESSION = 1047    ' -> HELLO/HRU/CLOSE/BYE Morse
 Const HZ_CLOSE    = 196       ' -> CLOSE (graceful hangup, low falling note)
 Const HZ_BYE      = 262       ' <- BYE   (the close is acknowledged)
@@ -115,7 +122,8 @@ Dim peerDone                  ' the uConsole has closed its half of the session
 Dim flowOn, winsz             ' optional bounded-window extension
 Dim zipOn, rawlen, zipped
 Dim lastProgress
-Dim beaconAt, beaconSeq
+Dim beaconAt, beaconBit, peerBeaconBit, beaconPending, beaconMarkAt
+Dim rmbState$
 
 BuildReflect                  ' must run after rtab%() is dimensioned
 
@@ -133,8 +141,12 @@ SetPin GP5, GP4, COM2
 Open "COM2:" + Str$(BASEBAUD) + "," + Str$(RXBUFSZ) As #1
 lastRx = Timer
 kaWin = KATMO
+rmbState$ = "NONE"
 beaconAt = Timer
-beaconSeq = 0
+beaconBit = 0
+peerBeaconBit = 0
+beaconPending = -1
+beaconMarkAt = Timer
 
 Print "PCUTP v2.1"
 
@@ -242,6 +254,8 @@ Do
   If n = 0 Then n = 1
   If blocks <> n Then Print #1, "ERR PROTOCOL": End
 
+  ' Remain in this transfer state until the full AYT/RST sequence finishes.
+  kaWin = RSTTMO
   Open DEST$ + fn$ + ".PART" For Output As #2
   Print "Downloading..."
   Tone1 HZ_TX_READY, MS_WORD
@@ -253,15 +267,34 @@ Do
   rcvd = 0
   drops = 0
   resets = 0
+  rmbState$ = "ACTIVE"
+  SaveRmb rmbState$
   lastProgress = Timer
   Do
-    s$ = RecvLine$(2 * ACKTMO)
+    ' A sender may need ACK timeout + guard + ten AYT? probes before it can
+    ' deliver RST.  Keep this control read open for that complete recovery
+    ' exchange instead of treating its halfway point as a protocol error.
+    s$ = RecvLine$(RSTTMO)
     If Left$(s$, 3) = "ERR" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Close #2: Print s$: End
     ' The uConsole half-closing: no more files after this one, but this one
     ' still finishes. Refusing here would throw away a transfer that is about
     ' to complete perfectly well.
     If s$ = "CLOSE" Then Print #1, "BYE" : MorseC HZ_RX_SESSION : MorseB HZ_TX_SESSION : peerDone = 1 : Continue Do
-    Split s$, meta$()                     ' DATA seq len crc
+    Split s$, meta$()
+    ' RST 0 <token> is a transfer-local reset initiated by uConsole after
+    ' failed AYT probes.  Keep this META/session, truncate only .PART, then
+    ' confirm before its BARRIER/RESUME establishes the seq=0 boundary.
+    If meta$(0) = "RST" And meta$(1) = "0" And meta$(2) <> "" Then
+      Print
+      Print "RST received; restarting transfer"
+      Close #2
+      Open DEST$ + fn$ + ".PART" For Output As #2
+      running = 0: seq = 0: rcvd = 0: drops = 0: resets = 0
+      rmbState$ = "RESET": SaveRmb rmbState$
+      Print #1, "RST-ACK " + meta$(2) + " 0"
+      Tone1 HZ_RX_RST, MS_WORD: Tone1 HZ_TX_RST_ACK, MS_WORD
+      Continue Do
+    EndIf
     If meta$(0) = "DONE" Then
       If seq <> blocks Then Print #1, "ERR PROTOCOL": Close #2: End
       Exit Do
@@ -316,6 +349,7 @@ Do
         Close #2
         Open DEST$ + fn$ + ".PART" For Output As #2
         running = 0: seq = 0: rcvd = 0: drops = 0
+        rmbState$ = "RESET": SaveRmb rmbState$
         Print #1, "RST 0"
       Else
         Print #1, "DROP " + Str$(seq) + " " + Str$(n)
@@ -344,6 +378,7 @@ Do
     ' which made the counter overshoot the file size.
     rcvd = rcvd + ln
     Print #1, "ACK " + Str$(n)
+    If (seq Mod 8) = 0 Or rcvd = size Then rmbState$ = "ACTIVE": SaveRmb rmbState$
     If (seq Mod DATA_SOUND_EVERY) = 0 Or rcvd = size Then Tone1 HZ_TX_ACK, MS_BLIP
     If Timer - lastProgress >= PROGRESS_MS Or rcvd = size Then
       Print Chr$(13) + Str$(rcvd) + " / " + Str$(size) + " bytes";
@@ -353,6 +388,7 @@ Do
   Print
 
   ' ---- final CRC -------------------------------------------------------
+  kaWin = KATMO
   Close #2
   Split s$, meta$()
   If meta$(0) <> "DONE" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print "protocol error": End
@@ -369,6 +405,10 @@ Do
 
   Tone1 HZ_TX_OK, MS_WORD
   Print #1, "OK " + Hex$(running, 8)
+  ' The completed file no longer has an active receive position.  Idle HERE
+  ' responses must describe the next transfer, which always starts at zero.
+  seq = 0
+  rmbState$ = "DONE"
   ' RENAME will not overwrite, so re-downloading a name that already exists
   ' aborted here with "Access denied" and left the .PART behind - after a
   ' fully verified transfer. Drop the old copy first; nothing is discarded
@@ -376,6 +416,7 @@ Do
   ' insensitive, so TURRICAN.MOD and turrican.mod are the same file.
   If MM.Info(Exists File DEST$ + fn$) Then Kill DEST$ + fn$
   Rename DEST$ + fn$ + ".PART" As DEST$ + fn$
+  If MM.Info(Exists File DEST$ + fn$ + ".PCUTP") Then Kill DEST$ + fn$ + ".PCUTP"
   Print "Transfer complete."
   Print "CRC32: OK"
   SndDone
@@ -384,6 +425,22 @@ Do
 Loop
 
 ' ---- teardown (section 7 of docs/PCUTP-session.md) -------------------
+' RMB reports the in-memory state. SaveRmb writes the same transfer facts to
+' a sidecar file so an interrupted .PART is never polluted with control data.
+Sub ReplyRmb(bit$)
+  Local name$
+  name$ = fn$
+  If name$ = "" Then name$ = "-"
+  Print #1, "RMB " + bit$ + " " + rmbState$ + " " + name$ + " " + Str$(size) + " " + Str$(seq) + " " + Hex$(fcrc, 8)
+  Tone1 HZ_TX_RMB, MS_WORD
+End Sub
+
+Sub SaveRmb(state$)
+  Open DEST$ + fn$ + ".PCUTP" For Output As #3
+  Print #3, state$ + " " + fn$ + " " + Str$(size) + " " + Str$(blksz) + " " + Str$(blocks) + " " + Str$(seq) + " " + Str$(rcvd) + " " + Hex$(fcrc, 8) + " " + Hex$(running, 8)
+  Close #3
+End Sub
+
 ' CLOSE is FIN and BYE is FIN-ACK, and each direction closes on its own.
 ' v1 sent one unacknowledged CLOSE and hung up, which left this end with no
 ' evidence the uConsole had heard it: a CLOSE that went missing stranded the
@@ -549,10 +606,19 @@ Function RecvLine$(tmo)
           MorseO HZ_TX_PONG
         ElseIf Left$(s$, 5) = "AYT? " Then
           Tone1 HZ_RX_AYT, MS_WORD
+          Print
+          Print "[AYT] STILL ALIVE?"
           Print #1, "HERE " + Mid$(s$, 6) + " " + Str$(seq)
+          Print "TX> HERE " + Mid$(s$, 6) + " seq=" + Str$(seq)
           Tone1 HZ_TX_HERE, MS_WORD
+        ElseIf Left$(s$, 7) = "AYT-OK " Then
+          Print "[AYT] LINK RESTORED"
+        ElseIf Left$(s$, 5) = "RMB? " Then
+          Tone1 HZ_RX_RMB, MS_WORD: ReplyRmb Mid$(s$, 6)
         ElseIf Left$(s$, 9) = "BEACON U " Then
-          MorseB HZ_RX_BEACON
+          BeaconU s$
+        ElseIf Left$(s$, 7) = "MARK U " Then
+          MarkerU s$
         ElseIf Left$(s$, 5) <> "PONG " Then
           RecvLine$ = s$
           Exit Function
@@ -605,8 +671,23 @@ Function InputAlive$(prompt$)
           MorseP HZ_RX_PING
           MorseO HZ_TX_PONG
         EndIf
-        If Left$(u$, 5) = "AYT? " Then Print #1, "HERE " + Mid$(u$, 6) + " " + Str$(seq)
-        If Left$(u$, 9) = "BEACON U " Then MorseB HZ_RX_BEACON
+        If Left$(u$, 5) = "AYT? " Then
+          ' InputAlive$ owns a no-newline prompt, so put diagnostics on their
+          ' own lines and redraw the user's partial URL afterwards.
+          Print
+          Print "[AYT] STILL ALIVE?"
+          Print #1, "HERE " + Mid$(u$, 6) + " " + Str$(seq)
+          Print "TX> HERE " + Mid$(u$, 6) + " seq=" + Str$(seq)
+          Print prompt$; txt$;
+        EndIf
+        If Left$(u$, 7) = "AYT-OK " Then
+          Print
+          Print "[AYT] LINK RESTORED"
+          Print prompt$; txt$;
+        EndIf
+        If Left$(u$, 5) = "RMB? " Then Tone1 HZ_RX_RMB, MS_WORD: ReplyRmb Mid$(u$, 6)
+        If Left$(u$, 9) = "BEACON U " Then BeaconU u$
+        If Left$(u$, 7) = "MARK U " Then MarkerU u$
         ' The uConsole is shutting down. Answering and quitting the prompt is
         ' what turns a clean shutdown into "Disconnected" instead of the
         ' keep-alive timer reporting it as "Link lost" ten seconds later.
@@ -617,9 +698,11 @@ Function InputAlive$(prompt$)
       EndIf
     EndIf
 
-    If Timer - beaconAt > BEACONMS Then
-      beaconSeq = beaconSeq + 1
-      Print #1, "BEACON P " + Str$(beaconSeq)
+    If beaconPending < 0 And Timer - beaconAt > BEACONMS Then
+      beaconPending = beaconBit
+      beaconMarkAt = Timer
+      Print #1, "BEACON P " + Str$(beaconPending)
+      beaconBit = 1 - beaconBit
       MorseB HZ_TX_BEACON
       beaconAt = Timer
     EndIf
@@ -701,6 +784,33 @@ End Sub
 
 ' Short Morse signatures used only while idle. The wire response is sent
 ' before these routines run, so their pauses never delay PONG transmission.
+Sub BeaconU(s$)
+  Local bit
+  bit = Val(Mid$(s$, 10))
+  If Mid$(s$, 10) <> Str$(bit) Or bit < 0 Or bit > 1 Then Exit Sub
+  MorseB HZ_RX_BEACON
+  If bit = peerBeaconBit Then
+    peerBeaconBit = 1 - peerBeaconBit
+  Else
+    ' A recovered uConsole restarts its beacon phase at zero.  Accept the
+    ' observed bit as the new phase instead of showing a false MARK error.
+    peerBeaconBit = 1 - bit
+  EndIf
+  ' Receipt marker proves the uConsole-to-PicoCalc direction is intact.
+  Print #1, "MARK P U " + Str$(bit)
+  MorseM HZ_TX_MARK
+End Sub
+
+Sub MarkerU(s$)
+  Local bit
+  ' MARK U P b confirms uConsole received PicoCalc's BEACON P b.
+  If Left$(s$, 9) <> "MARK U P " Then Exit Sub
+  bit = Val(Mid$(s$, 10))
+  If Mid$(s$, 10) <> Str$(bit) Or bit < 0 Or bit > 1 Then Exit Sub
+  If bit = beaconPending Then beaconPending = -1
+  MorseM HZ_RX_MARK
+End Sub
+
 Sub MorseB(hz)                 ' B: -...
   Local i
   Tone1 hz, 3 * MORSE_UNIT: Pause 4 * MORSE_UNIT
@@ -708,6 +818,14 @@ Sub MorseB(hz)                 ' B: -...
     Tone1 hz, MORSE_UNIT
     If i < 3 Then Pause 2 * MORSE_UNIT
   Next i
+End Sub
+
+Sub MorseM(hz)                 ' M: --
+  If BEEP Then
+    Tone1 hz, MORSE_UNIT * 3
+    Pause MORSE_UNIT
+    Tone1 hz, MORSE_UNIT * 3
+  EndIf
 End Sub
 
 Sub MorseP(hz)                 ' P: .--.

@@ -45,7 +45,12 @@ PITCH = {
     "RESUME": 554,
     "DROP": 185,
     "RST": 123,
+    "RST-ACK": 138,
     "AYT?": 698,
+    "AYT-OK": 784,
+    "RMB?": 932,
+    "RMB": 1047,
+    "RMB-ACK": 1175,
     "HERE": 880,
     "BYE": 131,
     "ACK": 440,
@@ -59,6 +64,7 @@ PITCH = {
     "PING": 740,
     "PONG": 831,
     "BEACON": 622,
+    "MARK": 659,
 }
 # Keep-alive words are audible too, so the entire wire vocabulary is covered.
 
@@ -71,6 +77,7 @@ SHORT = {"DATA", "ZDATA", "ACK", "HRU", "PING", "PONG"}
 # Morse-like session signatures. Transmit uses twice the receive pitch.
 MORSE = {
     "BEACON": "-...",       # B
+    "MARK": "--",            # M
     "PING": ".--.",         # P
     "PONG": ".--. ---",    # PO
     "HELLO": "....",        # H

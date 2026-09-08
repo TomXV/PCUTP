@@ -4,6 +4,7 @@ This is the reference receiver: it mirrors what PCUTP.BAS must do, and lets
 the whole protocol be exercised in CI without any hardware.
 """
 
+import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -162,12 +163,14 @@ class PcutpClient:
         self.dest_dir.mkdir(parents=True, exist_ok=True)
         final = self.dest_dir / meta.filename
         part = final.with_name(meta.filename + const.PART_SUFFIX)
+        checkpoint = final.with_name(meta.filename + ".PCUTP")
 
         self.link.send_line("READY")
         expected = 0
         running = 0
         received = 0
         drops = resets = 0
+        self._write_rmb(checkpoint, meta, "ACTIVE", expected, received, running)
         with open(part, "wb") as handle:
             while True:
                 header = self.link.recv_line(const.ACK_TIMEOUT * 2)
@@ -175,6 +178,17 @@ class PcutpClient:
                 parts = header.split()
                 if len(parts) == 2 and parts[0] == "AYT?" and parts[1].isdecimal():
                     self.link.send_line(f"HERE {parts[1]} {expected}")
+                    continue
+                if (len(parts) == 3 and parts[:2] == ["RST", "0"]
+                        and parts[2].isdecimal()):
+                    # The sender has confirmed that its recovery probes found
+                    # no usable state.  This is transfer-local: retain META
+                    # and the current session, discard only the partial file.
+                    handle.seek(0)
+                    handle.truncate()
+                    expected = running = received = drops = resets = 0
+                    self._write_rmb(checkpoint, meta, "RESET", expected, received, running)
+                    self.link.send_line(f"RST-ACK {parts[2]} 0")
                     continue
                 if parts[:1] == ["DONE"]:
                     if expected != meta.blocks:
@@ -250,6 +264,8 @@ class PcutpClient:
                 received += len(payload)
                 expected += 1
                 self.link.send_line(f"ACK {seq}")
+                if expected == meta.blocks or expected % 8 == 0:
+                    self._write_rmb(checkpoint, meta, "ACTIVE", expected, received, running)
                 if self.on_progress:
                     self.on_progress(received, meta.size)
 
@@ -262,4 +278,19 @@ class PcutpClient:
             return Download(path=part, meta=meta, ok=False)
         self.link.send_line(f"OK {actual}")
         os.replace(part, final)
+        checkpoint.unlink(missing_ok=True)
         return Download(path=final, meta=meta, ok=True)
+
+    @staticmethod
+    def _write_rmb(
+        checkpoint: Path, meta: Meta, state: str, next_seq: int, received: int, running: int,
+    ) -> None:
+        """Atomically checkpoint recovery metadata beside, never inside, PART."""
+        record = {
+            "state": state, "filename": meta.filename, "size": meta.size,
+            "blocksize": meta.blocksize, "blocks": meta.blocks, "next_seq": next_seq,
+            "received": received, "crc32": meta.crc32, "running_crc32": to_hex(running),
+        }
+        temporary = checkpoint.with_name(checkpoint.name + ".TMP")
+        temporary.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="ascii")
+        os.replace(temporary, checkpoint)

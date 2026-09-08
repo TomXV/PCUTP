@@ -66,12 +66,34 @@ ACK用の帯域はUARTの逆方向を利用する。
 
 既存の `DATA <seq> <len> <crc>` を継続する。seqはファイルごとに0から始まり、
 ブロックごとに1増え、ファイル中では折り返さない。圧縮・非圧縮で同じ番号空間を使う。
+`OK <file-crc>`でファイルが確定した後はアクティブな受信番号を0へ戻すため、アイドル中の
+`HERE`は次に開始するファイルの位置として`0`を返す。
 FLOWモードの `ACK n` は0〜nの連続ブロックを保存したという累積確認。
 重複ACKでは送信枠を増やさず、未送信番号へのACKは拒否する。
 受信済みブロックが再び来た場合はACKを返すだけで、ファイルや通算CRCに二重反映しない。
 最終ブロック後もDONEまでDATAを処理し、最後のACK欠落にも対応する。
 
 ## 3. 再送時のバリア
+
+### 3.0 RMB — 受信状態の記憶と照会
+
+`.PART`は常に受信バイト列だけを保持する。RMB用の状態は同じ保存先の
+`<filename>.PCUTP`へ別に保存し、`ACTIVE`、`RESET`、ファイル名、サイズ、ブロックサイズ、
+総ブロック数、`next-seq`、保存済みバイト数、目標CRC、通算CRCを記録する。開始、RST、
+8ブロックごと、最終ブロックで更新するため、SDカードへの状態書込みが通常のUART転送を
+支配しない。Python参照受信側は一時ファイルからrenameして更新する。`OK`でファイルを
+確定したら`.PART`とサイドカーを削除し、メモリ上の状態だけを`DONE`、seq 0にする。
+
+uConsoleはアイドル中または制御行待ち中に`RMB? <bit>`を送り、PicoCalcは次を返す。
+
+```text
+RMB? 0 -------------------------------------->
+         <------------------------------------ RMB 0 ACTIVE FILE.BIN 102400 14 8DACBD9E
+RMB-ACK 0 ----------------------------------->
+```
+
+bitは診断ごとに0から始める。PicoCalcは同じbitの再送に同じ状態を返す。`RMB-ACK`が
+欠けてもファイル転送や既存セッションをリセットしない。
 
 受信側は期待番号より先の`DATA`を受けた場合、`DROP <expected> <received>`で欠落を
 明示する。送信側は新規送信を止め、BARRIER/RESUMEで古い飛行分を排出してexpectedから
@@ -105,8 +127,8 @@ ACKだけが欠落していた場合はデータの再送を省略できる。
 
 ### 3.1 転送中の無応答確認
 
-ACKが15秒来なくても、受信側は最大20秒のRAW受信中かもしれない。RAWの途中へ制御行を
-送ると`AYT?`自体がファイル内容になるため、送信側はさらに6秒待ち、その間に遅いACK、
+ACKが12秒来なくても、受信側は最大20秒のRAW受信中かもしれない。RAWの途中へ制御行を
+送ると`AYT?`自体がファイル内容になるため、送信側はさらに1秒待ち、その間に遅いACK、
 NAK、DROPが来れば通常の回復へ渡す。その後だけ次を最大10回、3秒間隔で送る。
 
 ```text
@@ -117,10 +139,24 @@ PicoCalc -> HERE <probe-id> <next-seq>
 probe-idは遅延した古いHEREとの混同を防ぐ。HEREを受けても直ちにDATAを送らず、必ず
 BARRIER/RESUMEを交換してバイト境界を確定し、next-seqからWINDOW=1で再開する。
 PicoCalcでRAW受信が20秒以内に完了しなければプログラムを終了せず、受信途中のブロックを
-破棄して`DROP <expected> RAW`を返す。AYT?に10回応答がなければリンク喪失とする。
+破棄して`DROP <expected> RAW`を返す。AYT?に10回応答がなければ、送信側は次の
+転送内リセットを試みる。PicoCalcは確認済みの`RST 0 <token>`だけで`.PART`、通算CRC、
+受信番号を初期化し、HELLOへ戻らない。`RST-ACK`の受信後にBARRIER/RESUMEでゼロ境界を
+確定するため、古いDATAと新しいDATAを混同しない。RST-ACKが3回の送信試行でも来ない時だけ
+リンク喪失として終了する。
 
 ```text
-ACK timeout -> 6s guard -> AYT? -> HERE -> BARRIER -> RESUME -> retransmit
+uConsole                                      PicoCalc
+RST 0 42 -----------------------------------> .PARTを破棄、seq=0
+         <----------------------------------- RST-ACK 42 0
+BARRIER 43 --------------------------------->
+         <----------------------------------- RESUME 43 0
+DATA 0 + payload --------------------------->
+```
+
+```text
+ACK timeout -> 1s guard -> AYT? -> HERE -> BARRIER -> RESUME -> retransmit
+10 x AYT? timeout -> RST 0 token -> RST-ACK -> BARRIER -> RESUME 0 -> DATA 0
 RAW timeout --------------------> DROP RAW -------^
 ```
 
@@ -130,24 +166,15 @@ RTS/CTSは使わない。TX、RX、GNDの3線だけで、WINDOW/ACKによる通�
 ### 3.2 アイドル中のキープアライブ
 
 URL入力などのアイドル状態では、4秒ごとに方向付きビーコンを交換する。uConsoleは
-`BEACON U n`、PicoCalcは`BEACON P n`を送り、応答は要求しない。通常はこれだけで
-双方が相手から受信できていると分かる。自分と同じ方向タグのビーコンはUARTブリッジの
-ローカルエコーとして無視する。
+`BEACON U 0` / `BEACON U 1`、PicoCalcは`BEACON P 0` / `BEACON P 1`を交互に送る。受信側は必ず`MARK <送信元> <受信方向> <bit>`を返す。たとえば`BEACON U 0`への確認は`MARK P U 0`である。このMARKが送信方向の配線確認になる。
 
-PicoCalcからのビーコンが途絶えた場合だけ、uConsoleは5秒ごとに番号付きPINGを開始する。
-PicoCalcは同じ番号のPONGを返す。古いPONGおよび自分のPINGのエコーは生存応答に数えず、
-3回連続で応答がなければ約20秒でセッションを破棄する。両側とも次はHELLOから再接続する。
+MARKが欠けた時点で通常ビーコンを停止し、`PING 0`、`PING 1`を順に送る。対応PONGが来れば制御ループは動いているためリンクを維持する。PONGが来なければ`AYT? 0`、`AYT? 1`を順に送り、PicoCalcは`HERE <bit> <next-seq>`で状態を返す。各診断は必ず0から始まり、復帰時にPING/AYTの位相を0へ戻すため、`1 -> 0`をひとつの診断として送らない。HEREが来ればuConsoleは`AYT-OK <bit>`を返し、PicoCalcは`[AYT] LINK RESTORED`を表示して診断状態を解除する。ビーコン位相は0へ戻してからBARRIER/RESUMEで回復し、PING/PONG/HEREの全てが欠けた時だけ送信方向断と判定する。相手からのBEACONも欠けた場合は受信方向断または両方向断と判定する。
 
 ```text
-uConsole                         PicoCalc
-   |---- BEACON U 21 ---------------->|
-   |<--- BEACON P 34 -----------------|
-
-障害時:
-   |---- PING 22 ------------------->|  5秒無応答
-   |---- PING 23 ------------------->|  5秒無応答
-   |---- PING 24 ------------------->|  5秒無応答
-   |  link lost -> HELLO再接続         |
+BEACON U 0 -> MARK P U 0
+MARK欠落 -> PING 0 -> PING 1 -> PONG 1 (維持)
+                                \-> AYT? 0 -> AYT? 1 -> HERE 1 <next-seq> -> AYT-OK 1 (回復)
+                                      \-> 無応答 (TX断)
 ```
 
 PINGはRAWデータの途中には送らない。DATA転送中は前節のAYT?/HEREを使い、HTTP取得中は
@@ -255,6 +282,7 @@ HTTPはホスト上の固定データで置き換え、インターネット変�
 | `ZDATA` | 415 Hz | 三角波 | 12 ms |
 | `BARRIER` | 196 Hz | 正弦波 | 45 ms |
 | `RESUME` | 554 Hz | 正弦波 | 45 ms |
+| `RST-ACK` | 138 Hz | 正弦波 | 45 ms |
 | `BYE` | 131 Hz | 正弦波 | 45 ms |
 | `ACK` | 440 Hz | 三角波 | 12 ms |
 | `NAK` | 147 Hz | 矩形波 | 45 ms |

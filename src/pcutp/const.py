@@ -18,12 +18,13 @@ MAX_FILE_SIZE = 16 * 1024 * 1024  # 16 MiB
 MAX_RETRIES = 5          # per block, section 15
 MAX_DROPS = 3            # sequence gaps before restarting the file
 MAX_RESETS = 2           # full-file restarts before aborting
+RST_RETRIES = 3          # RST 0 token attempts before declaring the peer lost
 FLOW_GROW_ACKS = 8       # clean cumulative ACKs before widening cwnd
-ACK_TIMEOUT = 15.0       # seconds; includes SD-card writes and recovery barriers
+ACK_TIMEOUT = 12.0       # seconds; includes SD-card writes and recovery barriers
 MAX_TIMEOUTS = 5         # section 16
 LINE_TIMEOUT = 30.0      # generic control-line read timeout
-DATA_TIMEOUT = 20.0      # PicoCalc side: raw payload after a DATA header
-PROBE_GUARD = 6.0        # after ACK timeout, let a 20s raw read finish first
+DATA_TIMEOUT = 12.0      # PicoCalc side: raw payload after a DATA header
+PROBE_GUARD = 1.0        # after ACK timeout, let a 20s raw read finish first
 PROBE_TIMEOUT = 3.0      # wait for one HERE response
 PROBE_RETRIES = 10       # tolerate a manually reconnected three-wire link
 

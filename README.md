@@ -215,6 +215,10 @@ Linux/uConsoleでは、リポジトリ内のスクリプトからデーモンを
 既定値は `/dev/ttyACM0`、115200 baud、WINDOW=2、BLOCK=4096、trace・sound有効。
 たとえば別ポートなら `PCUTP_PORT=/dev/ttyUSB1 ./scripts/pcutpd.sh` と指定できます。
 
+ファイル転送前に配線とプロトコルだけを確認する場合は、PicoCalcへ
+`picocalc/PCTEST.BAS`を配置して実行します。GP4/GP5/GND、3-way handshake、双方向
+BEACON、番号付きPING/PONG、CLOSE/BYEを順番に検査し、成功時は`PASS`を表示します。
+
 そのため、たとえば以下のような構成が考えられます。
 
 - 一般的なUSB-UARTドングル

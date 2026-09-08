@@ -98,7 +98,8 @@ class PcutpServer:
         self._pending: str | None = None
 
     # -- top level -------------------------------------------------------
-    def serve_once(self, timeout: float = const.LINE_TIMEOUT) -> None:
+    def serve_once(self, timeout: float = const.LINE_TIMEOUT,
+                   on_idle: "Callable[[], None] | None" = None) -> None:
         """Three-way HELLO/HELLO-HRU?/HRU handshake, then serve GETs.
 
         Returns None if the handshake fails; otherwise it keeps serving GETs
@@ -114,7 +115,12 @@ class PcutpServer:
             if self._pending is not None:
                 request, self._pending = self._pending, None
             else:
-                request = self.link.recv_line(timeout, keepalive=self.keepalive)
+                request = self.link.recv_line(timeout, keepalive=self.keepalive, on_idle=on_idle)
+            parts = request.split()
+            if len(parts) >= 2 and parts[0] == "RMB" and parts[1] in {"0", "1"}:
+                self.link.send_line(f"RMB-ACK {parts[1]}")
+                self.link.log(f"RMB state: {request}")
+                continue
             if request == "CLOSE":
                 # The peer has stopped sending requests. Acknowledge that half,
                 # then close this one: nothing is in flight here, because a GET
@@ -125,7 +131,7 @@ class PcutpServer:
                 self.link.linger()
                 self.link.log("session closed by peer")
                 return
-            if request.startswith("HELLO "):
+            if request.startswith(("HELLO ", "HELLO? ")):
                 # Peer restarted mid-session: re-run the handshake and keep
                 # serving, rather than treating it as a protocol error.
                 if not self._handle_hello(request):
@@ -196,6 +202,12 @@ class PcutpServer:
             self._fail(ProtocolError(f"expected HRU, got {reply!r}"))
             return False
         self.link.sound.handshake_connected()
+        # A fresh session restarts the idle heartbeat and probe numbering so a
+        # session does not inherit the counters of the one before it. Guarded
+        # with getattr so lightweight test links without the method still work.
+        reset = getattr(self.link, "reset_session", None)
+        if reset is not None:
+            reset()
         return True
 
     def _handle_get(self, line: str) -> "TransferResult | None":
@@ -415,9 +427,12 @@ class PcutpServer:
                 return late
         except TimeoutError_:
             pass
-        self._barrier_id += 1
-        probe = str(self._barrier_id)
         for _ in range(self.probe_retries):
+            # Bump the probe id on each retry so a delayed HERE for an earlier
+            # AYT? cannot be mistaken for the answer to the current one. The id
+            # shares the barrier counter, which only ever increases.
+            self._barrier_id += 1
+            probe = str(self._barrier_id)
             self.link.send_line(f"AYT? {probe}")
             try:
                 parts = self.link.recv_line(self.probe_timeout).split()
@@ -431,7 +446,29 @@ class PcutpServer:
                 return f"DROP {next_seq} {next_seq}"
             if parts and parts[0] in {"ACK", "NAK", "DROP", "RST", "ERR"}:
                 return " ".join(parts)
-        raise LinkLostError("receiver did not answer AYT?")
+        # The AYT? exchange found no live receiver.  Do not turn that into a
+        # new HELLO session: RST is a transfer-local request to discard the
+        # partial file and restart this META at sequence zero.  Its token makes
+        # a delayed acknowledgement harmless, just like BARRIER/RESUME.
+        self._barrier_id += 1
+        token = str(self._barrier_id)
+        for _ in range(const.RST_RETRIES):
+            self.link.send_line(f"RST 0 {token}")
+            deadline = time.monotonic() + self.probe_timeout
+            while time.monotonic() < deadline:
+                try:
+                    parts = self.link.recv_line(deadline - time.monotonic()).split()
+                except TimeoutError_:
+                    break
+                if parts == ["RST-ACK", token, "0"]:
+                    return "RST 0"
+                # These may be delayed answers to the flight that timed out.
+                # The reset confirmation is the only answer that commits a
+                # fresh transfer, so keep waiting for it.
+                if parts and parts[0] in {"ACK", "NAK", "DROP", "HERE", "RESUME"}:
+                    continue
+                raise ProtocolError(f"unexpected reset reply: {parts!r}")
+        raise LinkLostError("receiver did not acknowledge transfer reset")
 
     def _old_resume(self, parts: list[str]) -> bool:
         return (len(parts) == 3 and parts[0] == "RESUME" and parts[1].isdecimal()

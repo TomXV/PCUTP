@@ -281,7 +281,8 @@ def test_close_ends_session_cleanly_and_server_serves_again(tmp_path):
     assert [r.filename for r in results] == ["AGAIN.BIN"]
 
 
-def test_rehello_during_session_rehandshakes(tmp_path):
+@pytest.mark.parametrize("hello", ["HELLO PCUTP/2", "HELLO? PCUTP/2"])
+def test_rehello_during_session_rehandshakes(tmp_path, hello):
     payload = b"x" * 100
     _, server, client, results = make_pair(tmp_path, payload, block_size=64)
     thread = run_server(server, results)
@@ -289,8 +290,8 @@ def test_rehello_during_session_rehandshakes(tmp_path):
     client.hello()
     # Peer restarts: a second HELLO mid-session must re-run the handshake,
     # not come back as ERR PROTOCOL.
-    client.link.send_line("HELLO PCUTP/2")
-    assert client.link.recv_line(5.0).startswith("HELLO PCUTP/2 HRU? ")
+    client.link.send_line(hello)
+    assert client.link.recv_line(5.0).startswith(("HELLO PCUTP/2 HRU? ", "OHRU PCUTP/2 "))
     client.link.send_line("HRU")
 
     # And the session still carries a transfer afterwards.

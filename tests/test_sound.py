@@ -58,7 +58,9 @@ def test_every_current_control_word_has_a_distinct_pitch():
     words = {
         "HELLO", "HELLO?", "OHRU", "HRU", "GET", "FETCHING", "META", "READY",
         "DATA", "ZDATA", "ACK", "NAK", "DONE", "OK", "FAIL", "ERR", "PING", "PONG",
-        "CLOSE", "BYE", "BARRIER", "RESUME", "DROP", "RST", "AYT?", "HERE", "BEACON",
+        "CLOSE", "BYE", "BARRIER", "RESUME", "DROP", "RST", "RST-ACK", "AYT?", "AYT-OK",
+        "RMB?", "RMB", "RMB-ACK", "HERE",
+        "BEACON", "MARK",
     }
     assert set(PITCH) == words
     assert len(set(PITCH.values())) == len(words)
@@ -67,6 +69,7 @@ def test_every_current_control_word_has_a_distinct_pitch():
 def test_keepalive_words_have_morse_signatures():
     unit_bytes = int(RATE * MORSE_UNIT_MS / 1000) * 2
     assert MORSE["BEACON"] == "-..."
+    assert MORSE["MARK"] == "--"
     assert MORSE["PING"] == ".--."
     assert MORSE["PONG"] == ".--. ---"
     assert MORSE["HELLO"] == "...."

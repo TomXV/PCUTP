@@ -4,7 +4,9 @@ import threading
 
 import pytest
 
-from pcutp.client import PcutpClient
+from pcutp import const
+from pcutp.client import Meta, PcutpClient
+from pcutp.crc import crc32_hex
 from pcutp.errors import ProtocolError
 from pcutp.fetcher import Fetched
 from pcutp.flow import options
@@ -313,3 +315,100 @@ def test_ack_for_unsent_sequence_is_rejected():
     server = PcutpServer(Peer(), block_size=64)
     with pytest.raises(ProtocolError, match="unsent"):
         server._send_window(b"x" * 128, 2)
+
+
+def test_ayt_probe_id_increments_per_retry():
+    from pcutp.errors import LinkLostError, TimeoutError_
+
+    class Peer:
+        def __init__(self):
+            self.probes = []
+            self.sent = []
+
+        def send_line(self, line):
+            self.sent.append(line)
+            if line.startswith("AYT? "):
+                self.probes.append(line.split()[1])
+
+        def recv_line(self, timeout):
+            raise TimeoutError_("silent")
+
+    peer = Peer()
+    server = PcutpServer(peer, block_size=64, probe_guard=0.0, probe_timeout=0.0)
+    with pytest.raises(LinkLostError):
+        server._probe_receiver(0)
+    # Every retry must carry a fresh id so a delayed HERE cannot be mistaken
+    # for the answer to the current AYT?.
+    assert peer.probes == [str(i) for i in range(1, len(peer.probes) + 1)]
+    assert len(peer.probes) == server.probe_retries
+    resets = peer.sent[-const.RST_RETRIES:]
+    assert len(resets) == const.RST_RETRIES
+    assert all(line.startswith("RST 0 ") for line in resets)
+    assert len({line.split()[2] for line in resets}) == 1
+
+
+def test_silent_receiver_reset_restarts_the_same_transfer_at_zero():
+    from pcutp.errors import TimeoutError_
+
+    class Peer:
+        def __init__(self):
+            self.lines = []
+            self.pending = []
+            self.data_sends = 0
+            self.reset = False
+
+        def send_line_and_raw(self, line, data):
+            self.data_sends += 1
+            if self.reset:
+                self.pending.append("ACK 0")
+
+        def send_line(self, line):
+            self.lines.append(line)
+            parts = line.split()
+            if len(parts) == 3 and parts[:2] == ["RST", "0"]:
+                self.reset = True
+                self.pending.append(f"RST-ACK {parts[2]} 0")
+            elif len(parts) == 2 and parts[0] == "BARRIER":
+                self.pending.append(f"RESUME {parts[1]} 0")
+
+        def recv_line(self, timeout):
+            if self.pending:
+                return self.pending.pop(0)
+            raise TimeoutError_("silent")
+
+    peer = Peer()
+    server = PcutpServer(
+        peer, block_size=64, max_retries=2, ack_timeout=0.01,
+        probe_guard=0.0, probe_timeout=0.01, probe_retries=1,
+    )
+    assert server._send_window(b"x" * 64, 1) == 0
+    assert peer.data_sends == 2
+    assert any(line.startswith("RST 0 ") for line in peer.lines)
+    assert any(line.startswith("BARRIER ") for line in peer.lines)
+
+
+def test_reference_receiver_keeps_meta_across_sender_reset(tmp_path):
+    pipe = PipePair()
+    pipe.left.read_timeout = pipe.right.read_timeout = 0.001
+    client = PcutpClient(Link(pipe.right), tmp_path)
+    client.flow = True
+    payload = b"reset-transfer"
+    meta = Meta("RESET.BIN", len(payload), 64, 1, crc32_hex(payload))
+    result = []
+
+    thread = threading.Thread(target=lambda: result.append(client._receive(meta)), daemon=True)
+    thread.start()
+    sender = Link(pipe.left)
+    assert sender.recv_line(1) == "READY"
+    sender.send_line("RST 0 41")
+    assert sender.recv_line(1) == "RST-ACK 41 0"
+    sender.send_line("BARRIER 42")
+    assert sender.recv_line(1) == "RESUME 42 0"
+    sender.send_line_and_raw(f"DATA 0 {len(payload)} {crc32_hex(payload)}", payload)
+    assert sender.recv_line(1) == "ACK 0"
+    sender.send_line(f"DONE {crc32_hex(payload)}")
+    assert sender.recv_line(1) == f"OK {crc32_hex(payload)}"
+    thread.join(1)
+    assert result[0].ok
+    assert (tmp_path / "RESET.BIN").read_bytes() == payload
+    assert not (tmp_path / "RESET.BIN.PCUTP").exists()

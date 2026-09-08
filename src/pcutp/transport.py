@@ -32,13 +32,29 @@ class SerialTransport:
         # line, say). Draining only what's already buffered - falling back
         # to a bounded 1-byte read when nothing has arrived yet - avoids
         # paying that timeout on every control-line read.
-        waiting = self._ser.in_waiting
-        return self._ser.read(min(waiting, size) if waiting else 1)
+        try:
+            waiting = self._ser.in_waiting
+            return self._ser.read(min(waiting, size) if waiting else 1)
+        except OSError as exc:
+            raise self._link_error(exc) from exc
 
     def write(self, data: bytes) -> int:
-        n = self._ser.write(data)
-        self._ser.flush()
-        return n
+        try:
+            n = self._ser.write(data)
+            self._ser.flush()
+            return n
+        except OSError as exc:
+            raise self._link_error(exc) from exc
+
+    @staticmethod
+    def _link_error(exc: OSError) -> OSError:
+        # A pulled USB cable surfaces as a mix of serial.SerialException and
+        # plain OSError (FileNotFoundError, EIO, ...) depending on which call
+        # is first to touch the dead fd. Normalise them all to one type so the
+        # caller only has to catch SerialException to recognise a lost port.
+        import serial
+
+        return serial.SerialException(str(exc))
 
     def close(self) -> None:
         self._ser.close()
