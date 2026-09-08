@@ -169,7 +169,10 @@ class Link:
                                 f"MARK {keepalive.beacon_tx} {keepalive.beacon_rx} {bit}"
                             )
                     continue
-                if is_ping or is_pong or is_here:
+                # HERE belongs to transfer recovery unless this read owns an
+                # active idle keep-alive exchange. Do not swallow it here:
+                # `_probe_receiver` validates its arbitrary probe token.
+                if is_ping or is_pong or (is_here and keepalive is not None):
                     # Keep-alive lines are transparent to the protocol state
                     # machine, but they must remain visible in --trace output
                     # so an operator can tell that the link is alive.

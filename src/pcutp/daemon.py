@@ -173,7 +173,7 @@ def reconnect(
     link: Link,
     port: str,
     baud: int,
-    wait: "Callable[[str], bool]" = wait_for_port,
+    wait: "Callable[[str], bool] | None" = None,
     log: "Callable[[str], None]" = print,
 ) -> SerialTransport:
     """Wait for the port to come back, then splice a fresh transport into `link`.
@@ -183,6 +183,8 @@ def reconnect(
     is flushed, then ``discard_input()`` to drop that garbage before a new
     handshake. Returns the new SerialTransport.
     """
+    if wait is None:
+        wait = wait_for_port
     log(f"waiting for {port}")
     wait(port)
     log(f"{port} present; reconnecting")
