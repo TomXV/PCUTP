@@ -43,32 +43,70 @@ CRC は CRC-32/ISO-HDLC を使用し、ワイヤ上では大文字8桁の16進�
 
 ## 2. セッション確立と能力交渉
 
-PicoCalc が起呼側、uConsole が応答側である。最初の `HELLO` は受信能力の提示、応答の `HELLO ... HRU?` は合意案、最後の `HRU` は受諾である。
+PicoCalc が起呼側、uConsole が応答側である。図は上から下へ時間が進む。最初の `HELLO` は受信能力の提示、応答の `HELLO ... HRU?` は合意案、最後の `HRU` は受諾である。
+
+### 正常時のハンドシェイク・トレース
 
 ```text
-PicoCalc -> HELLO PCUTP/2 FLOW=1 MAXBLK=4096 WINDOW=2 RXBUF=16384 LZ4=1
-uConsole -> HELLO PCUTP/2 HRU? BAUD=115200 MAXBLK=4096 FLOW=1 WINDOW=2 LZ4=1
-PicoCalc -> HRU
+ TIME       PicoCalc (receiver)               uConsole (sender)
+              state: IDLE                        state: IDLE
+  |                 |                                  |
+  |  (1) Dial       |                                  |
+  |                 |  HELLO PCUTP/2                   |
+  |                 |  FLOW=1 MAXBLK=4096              |
+  |                 |  WINDOW=2 RXBUF=16384 LZ4=1      |
+  |                 |--------------------------------->|
+  |                 |                                  |
+  |                 |                         check PCUTP/2
+  |                 |                         choose common:
+  |                 |                         MAXBLK=4096
+  |                 |                         WINDOW=2
+  |                 |                                  |
+  |  (2) Proposal   |  HELLO PCUTP/2 HRU?              |
+  |                 |  BAUD=115200 MAXBLK=4096         |
+  |                 |  FLOW=1 WINDOW=2 LZ4=1           |
+  |                 |<---------------------------------|
+  |                 |                                  |
+  |                 | check proposed values            |
+  |                 |                         state: WAIT_HRU
+  |                 |                                  |
+  |  (3) Accept     |  HRU                             |
+  |                 |--------------------------------->|
+  |                 |                                  |
+  v          state: CONNECTED                  state: CONNECTED
+             +------------------------------------------+
+             | One session may carry multiple GETs.    |
+             +------------------------------------------+
 ```
 
-### ハンドシェイク図
+会話として読むと、(1)「この条件で話せます」、(2)「では、この条件でいいですか」、(3)「いいです」の3段階である。双方が `CONNECTED` になるのは、PicoCalc が合意案を検査して `HRU` を送り、uConsole がそれを受信した後である。
+
+### 応答を取りこぼした場合のトレース
 
 ```text
- PicoCalc (receiver)                              uConsole (sender)
-       |                                                 |
-       | HELLO PCUTP/2 + capabilities                    |
-       |------------------------------------------------>|
-       |                                                 | validate version
-       |                                                 | choose MAXBLK/WINDOW
-       | HELLO PCUTP/2 HRU? + proposal                   |
-       |<------------------------------------------------|
-       | validate proposal                               |
-       | HRU                                             |
-       |------------------------------------------------>|
-       |                                                 |
-       +=================== CONNECTED ==================+
-                 multiple GET requests may follow
+ TIME       PicoCalc                             uConsole
+  |            |                                    |
+  |            |  HELLO PCUTP/2 + capabilities      |
+  |            |----------------------------------->|
+  |            |                                    |
+  |            |  HELLO PCUTP/2 HRU? + proposal     |
+  |            |<-----------------------------X     |  lost
+  |            |                                    |
+  |            |  wait HANDSHAKE_TIMEOUT (10 s)     |
+  |            |                                    |
+  |            |  HELLO? PCUTP/2 + same capabilities|
+  |            |----------------------------------->|
+  |            |                                    |
+  |            |  OHRU PCUTP/2 + same proposal      |
+  |            |<-----------------------------------|
+  |            |                                    |
+  |            |  HRU                               |
+  |            |----------------------------------->|
+  v            |                                    |
+          CONNECTED                            CONNECTED
 ```
+
+`HELLO?` は別の交渉を始める要求ではなく、最初の挨拶への応答を聞き返す再送である。そのため uConsole は能力を選び直さず、同じ合意案を `OHRU` で返す。
 
 最初の応答を取りこぼした PicoCalc は `HELLO?` を最大9回追加で送れる。uConsole は同じ合意案を `OHRU PCUTP/2 ...` として返す。`PCUTP/2` 以外は `ERR VERSION` で拒否する。接続中に新しい `HELLO` を受けた場合も、ピアの再起動としてこの手順をやり直す。
 
