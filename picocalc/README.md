@@ -5,8 +5,39 @@ state machine plus helper routines (`RecvLine$`, `RecvRaw`, `Crc32`, `Split`).
 PicoMite BASIC has no `#Include` preprocessor, so there is no separate
 library file to also copy over.
 
-Copy it to the SD card (B:/) and run it with an absolute path — the SD
-launcher leaves the working directory at `B:/pico1-apps`, not `B:/`:
+## Getting PCUTP.BAS onto the card
+
+Pulling the SD card out and mounting it on a PC works, but during development
+the file changes often enough that the card shuffle dominates the edit cycle.
+The sender in
+[uart-xmodem-transfer](https://github.com/TomXV/uart-xmodem-transfer) sends it
+over the wire instead, using the `XMODEM RECEIVE` command already built into
+the PicoMite firmware - nothing has to be installed on the PicoCalc first, so
+this also works on a fresh card and when the copy on the card is broken.
+
+```sh
+python uart_xmodem_send.py picocalc/PCUTP.BAS "B:/PCUTP.BAS" --port COM4
+```
+
+Type nothing on the PicoCalc; the sender issues the `XMODEM RECEIVE` command
+itself. The PicoCalc must be sitting at the BASIC prompt.
+
+**This is the console port, not PCUTP's port.** `XMODEM RECEIVE` is a command
+typed at the prompt, so it runs over COM1 (GP0/GP1) - the console - while
+PCUTP runs over COM2 (GP4/GP5) as described below. Wire both, or move the
+cable, but do not expect one connection to serve both.
+
+Unverified on hardware: XMODEM transfers in 128-byte blocks and pads the last
+one, so a `.BAS` file whose length is not a multiple of 128 arrives with
+trailing padding bytes. Whether PicoMite trims them, and whether BASIC minds
+them if it does not, has not been checked here - confirm the transferred file
+runs before relying on this path.
+
+## Running it
+
+Wherever it came from, it lives on the SD card at `B:/` and needs an absolute
+path to run — the SD launcher leaves the working directory at `B:/pico1-apps`,
+not `B:/`:
 
 ```
 > RUN "B:/PCUTP.BAS"
