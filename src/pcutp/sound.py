@@ -442,9 +442,7 @@ class Sound:
         # Longer file, longer burst - up to a second, so a big fetch is
         # audibly bigger without the sound outlasting the fetch itself.
         reps = max(1, min(4, 1 + nbytes // 262144))
-        for _ in range(reps):
-            self._push(self._net["carrier"])
-        self._push(self._net["hangup"])
+        self._push(self._net["carrier"] * reps + self._net["hangup"])
 
     def effect(self, name: str) -> None:
         """Play one internet-leg effect by name. For `pcutpd sounds`."""

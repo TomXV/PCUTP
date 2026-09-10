@@ -113,3 +113,15 @@ def test_morse_transmit_pitch_is_higher_than_receive(monkeypatch):
     sound.line("HELLO PCUTP/2", direction="rx")
     sound.line("HELLO PCUTP/2", direction="tx")
     assert played == [b"low", b"high"]
+def test_net_response_publishes_carrier_and_hangup_as_one_event():
+    from pcutp.sound import Sound
+
+    sound = Sound(enabled=False)
+    sound.enabled = True
+    sound._net = {"carrier": b"carrier", "hangup": b"hangup"}
+    events = []
+    sound._push = events.append
+    for size, repetitions in [(0, 1), (262144, 2), (1048576, 4)]:
+        sound.net_response(size)
+        assert events[-1] == b"carrier" * repetitions + b"hangup"
+    assert len(events) == 3
