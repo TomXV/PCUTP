@@ -7,7 +7,7 @@ import pytest
 from pcutp import const
 from pcutp.client import PcutpClient
 from pcutp.crc import crc32_hex
-from pcutp.errors import LinkLostError, PcutpError, StorageError
+from pcutp.errors import LinkLostError, PcutpError, ProtocolError, StorageError
 from pcutp.fetcher import Fetched
 from pcutp.link import Link
 from pcutp.server import PcutpServer
@@ -363,6 +363,23 @@ def test_client_still_works_against_a_server_that_omits_fetching(tmp_path):
 
     assert download.ok
     assert (tmp_path / "OLD.BIN").read_bytes() == payload
+
+
+@pytest.mark.parametrize("line", [
+    "META X.BIN nope 64 1 00000000",
+    "META X.BIN 1 nope 1 00000000",
+    "META X.BIN 1 64 nope 00000000",
+    "META X.BIN 1 64 1 not-a-crc",
+])
+def test_malformed_meta_is_reported_as_protocol_error(tmp_path, line):
+    pipe = PipePair()
+    pipe.left.read_timeout = pipe.right.read_timeout = 0.01
+    client = PcutpClient(Link(pipe.right), dest_dir=tmp_path)
+    server = Link(pipe.left)
+
+    server.send_line(line)
+    with pytest.raises(ProtocolError):
+        client._recv_meta(1.0)
 
 
 def test_fetch_window_outlasts_the_fetch_itself():

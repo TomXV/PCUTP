@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import const
 from .compression import decompress
-from .crc import crc32, crc32_hex, to_hex
+from .crc import crc32, crc32_hex, parse_hex, to_hex
 from .errors import PcutpError, ProtocolError, StorageError, TimeoutError_
 from .flow import FRAME_OVERHEAD, MAX_WINDOW, RX_BUFFER, options
 from .link import Link
@@ -112,6 +112,8 @@ class PcutpClient:
         return maxblk
 
     def get(self, filename: str, url: str, timeout: float = 120.0) -> Download:
+        if self.peer_closing:
+            raise ProtocolError("peer has closed its send direction")
         self.link.send_line(f"GET {filename} {url}")
         meta = self._recv_meta(timeout)
         return self._receive(meta)
@@ -149,15 +151,29 @@ class PcutpClient:
         parts = line.split()
         if len(parts) != 6 or parts[0] != "META":
             raise ProtocolError(f"expected META, got {line!r}")
+        try:
+            if any(not value.isdecimal() for value in parts[2:5]):
+                raise ValueError("META dimensions must be decimal")
+            size, blocksize, blocks = (int(value) for value in parts[2:5])
+            checksum = parts[5].upper()
+            parse_hex(checksum)
+        except (TypeError, ValueError) as exc:
+            raise ProtocolError("invalid META numeric or CRC fields") from exc
         return Meta(
             filename=sanitize_filename(parts[1]),
-            size=int(parts[2]),
-            blocksize=int(parts[3]),
-            blocks=int(parts[4]),
-            crc32=parts[5].upper(),
+            size=size,
+            blocksize=blocksize,
+            blocks=blocks,
+            crc32=checksum,
         )
 
     def _receive(self, meta: Meta) -> Download:
+        try:
+            filename = sanitize_filename(meta.filename)
+            parse_hex(meta.crc32)
+        except (TypeError, ValueError, PcutpError) as exc:
+            self.link.send_line("ERR PROTOCOL")
+            raise ProtocolError("invalid META fields") from exc
         if (not 1 <= meta.blocksize <= self.max_block_size
                 or not 0 <= meta.size <= const.MAX_FILE_SIZE
                 or meta.blocks != max(1, -(-meta.size // meta.blocksize))):
@@ -167,9 +183,9 @@ class PcutpClient:
             self.link.send_line("ERR STORAGE")
             raise StorageError(f"{meta.size} bytes will not fit")
         self.dest_dir.mkdir(parents=True, exist_ok=True)
-        final = self.dest_dir / meta.filename
-        part = final.with_name(meta.filename + const.PART_SUFFIX)
-        checkpoint = final.with_name(meta.filename + ".PCUTP")
+        final = self.dest_dir / filename
+        part = final.with_name(filename + const.PART_SUFFIX)
+        checkpoint = final.with_name(filename + ".PCUTP")
 
         self.link.send_line("READY")
         expected = 0
@@ -219,6 +235,10 @@ class PcutpClient:
                 packed = self.compression and len(parts) == 5 and parts[0] == "ZDATA"
                 if not packed and (len(parts) != 4 or parts[0] != "DATA"):
                     raise ProtocolError(f"expected DATA, got {header!r}")
+                if (not parts[1].isdecimal() or not parts[2].isdecimal()
+                        or (packed and not parts[3].isdecimal())):
+                    self.link.send_line("ERR PROTOCOL")
+                    raise ProtocolError("invalid DATA numeric fields")
                 seq, length, want = int(parts[1]), int(parts[2]), parts[-1].upper()
                 raw_length = int(parts[3]) if packed else length
                 if not 0 <= length <= meta.blocksize or not 0 <= seq < meta.blocks:

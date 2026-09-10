@@ -2,8 +2,11 @@
 
 import threading
 
+import pytest
+
 from pcutp import const
 from pcutp.client import PcutpClient
+from pcutp.errors import ProtocolError
 from pcutp.fetcher import Fetched
 from pcutp.link import Link
 from pcutp.server import PcutpServer
@@ -123,6 +126,9 @@ def test_the_sender_may_half_close_and_still_finish_the_file(tmp_path):
     assert download.ok
     assert (tmp_path / "H.BIN").read_bytes() == payload
     assert client.peer_closing   # and the receiver knows not to ask for more
+
+    with pytest.raises(ProtocolError, match="closed its send direction"):
+        client.get("AFTER.BIN", "https://example.com/after.bin")
 
 
 def test_a_simultaneous_close_still_converges(tmp_path):
