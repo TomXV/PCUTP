@@ -623,7 +623,7 @@ Function RecvLine$(tmo)
           BeaconU s$
         ElseIf Left$(s$, 7) = "MARK U " Then
           MarkerU s$
-        ElseIf Left$(s$, 5) <> "PONG " Then
+        ElseIf Left$(s$, 5) <> "PONG " And Left$(s$, 8) <> "RMB-ACK " Then
           RecvLine$ = s$
           Exit Function
         EndIf

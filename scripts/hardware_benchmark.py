@@ -65,11 +65,13 @@ def main():
                         data = bytes([data[0] ^ 255]) + data[1:]
                     super().send_line_and_raw(line, data)
 
-                def recv_line(self, timeout, keepalive=None,
+                def recv_line(self, timeout, keepalive=None, on_idle=None,
                               requested=requested, confirmed=confirmed):
                     deadline = time.monotonic() + timeout
                     while True:
-                        line = super().recv_line(max(0, deadline - time.monotonic()), keepalive)
+                        line = super().recv_line(
+                            max(0, deadline - time.monotonic()), keepalive, on_idle=on_idle,
+                        )
                         if line == f"ACK {args.drop_ack}" and not self.dropped:
                             self.dropped = True
                             continue

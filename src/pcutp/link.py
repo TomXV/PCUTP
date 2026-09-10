@@ -139,7 +139,6 @@ class Link:
                     self.sound.line(text, direction="rx")
                     if keepalive is not None and parts[1] == keepalive.beacon_rx:
                         last_rx = time.monotonic()
-                        outstanding = None
                         probes_sent = 0
                         if is_marker:
                             # MARK P U 0 means the PicoCalc actually received
@@ -148,6 +147,8 @@ class Link:
                             if marked_direction == keepalive.beacon_tx and bit == beacon_waiting:
                                 beacon_waiting = None
                                 last_beacon_mark = time.monotonic()
+                                marker_probes = 0
+                                outstanding = None
                         else:
                             bit = int(parts[2])
                             if bit == self._peer_beacon_bit:
@@ -224,7 +225,7 @@ class Link:
             now = time.monotonic()
             if keepalive is not None:
                 idle = now - last_rx
-                if (marker_probes == 0
+                if (marker_probes == 0 and beacon_waiting is None
                         and now - last_beacon >= keepalive.beacon_interval):
                     beacon_waiting = self._beacon_bit
                     self.send_line(

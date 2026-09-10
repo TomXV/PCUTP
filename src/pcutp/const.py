@@ -27,6 +27,7 @@ DATA_TIMEOUT = 12.0      # PicoCalc side: raw payload after a DATA header
 PROBE_GUARD = 1.0        # after ACK timeout, let a 20s raw read finish first
 PROBE_TIMEOUT = 3.0      # wait for one HERE response
 PROBE_RETRIES = 10       # tolerate a manually reconnected three-wire link
+RECOVERY_TIMEOUT = 60.0  # receiver stays open through ACK + AYT + RST retries
 
 # Teardown (section 6 of docs/PCUTP-0.2.md). CLOSE is FIN, BYE is FIN-ACK,
 # and each direction closes independently.

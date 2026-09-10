@@ -185,18 +185,24 @@ def reconnect(
     """
     if wait is None:
         wait = wait_for_port
-    log(f"waiting for {port}")
-    wait(port)
-    log(f"{port} present; reconnecting")
-    # The bridge emits a burst of stray bytes (seen as `q` in the logs) as
-    # soon as it comes back; a short settle plus discard stops those being
-    # read as the first control line of the next session.
-    time.sleep(RECONNECT_SETTLE)
-    new_transport = SerialTransport(port, baud)
-    link.t = new_transport
-    link.discard_input()
-    log(f"serial reconnected: {port}")
-    return new_transport
+    while True:
+        log(f"waiting for {port}")
+        if not wait(port):
+            raise TimeoutError_(f"port did not reappear: {port}")
+        log(f"{port} present; reconnecting")
+        # USB enumeration can expose the path before the device can be opened,
+        # or the cable can disappear again between the check and the open.
+        time.sleep(RECONNECT_SETTLE)
+        try:
+            new_transport = SerialTransport(port, baud)
+        except OSError as exc:
+            log(f"serial not ready: {exc}")
+            time.sleep(RECONNECT_INTERVAL)
+            continue
+        link.t = new_transport
+        link.discard_input()
+        log(f"serial reconnected: {port}")
+        return new_transport
 
 
 def run_serial(args: argparse.Namespace) -> int:

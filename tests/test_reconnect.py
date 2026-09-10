@@ -137,3 +137,34 @@ def test_serial_transport_normalises_write_oserror(monkeypatch):
     t._ser = Boom()
     with pytest.raises(serial.SerialException):
         t.write(b"x")
+
+
+def test_reconnect_retries_when_enumerated_port_is_not_ready(monkeypatch):
+    import serial
+
+    attempts = []
+    replacement = FakeTransport()
+
+    def open_port(port, baud):
+        attempts.append(port)
+        if len(attempts) < 3:
+            raise serial.SerialException("device not ready")
+        return replacement
+
+    monkeypatch.setattr(daemon, "SerialTransport", open_port)
+    monkeypatch.setattr(daemon.time, "sleep", lambda seconds: None)
+    old = FakeTransport()
+    link = FakeLink(old)
+    assert reconnect(old, link, "port", 115200, wait=lambda port: True) is replacement
+    assert len(attempts) == 3
+    assert link.t is replacement
+    assert link.discard_called == 1
+
+
+def test_reconnect_respects_waiter_timeout(monkeypatch):
+    from pcutp.errors import TimeoutError_
+
+    monkeypatch.setattr(daemon, "SerialTransport", lambda *a: pytest.fail("must not open"))
+    old = FakeTransport()
+    with pytest.raises(TimeoutError_):
+        reconnect(old, FakeLink(old), "port", 115200, wait=lambda port: False)

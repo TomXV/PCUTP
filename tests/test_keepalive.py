@@ -85,6 +85,36 @@ def test_keepalive_sends_three_numbered_probes_before_link_loss():
     assert isinstance(outcome[0], LinkLostError)
 
 
+def test_peer_beacon_preserves_outstanding_ping(monkeypatch):
+    from types import SimpleNamespace
+
+    from pcutp import link as link_module
+
+    class Peer:
+        now = 0.0
+        pending = b""
+        diagnosed = False
+
+        def write(self, data):
+            if data == b"PING 0\n":
+                self.diagnosed = True
+                # Peer traffic can precede the receipt for our own probe.
+                self.pending += b"BEACON P 0\nPONG 0\n"
+            elif data.startswith(b"BEACON U ") and self.diagnosed:
+                self.pending += b"GET OK.BIN https://example.com/ok\n"
+            return len(data)
+
+        def read(self, size):
+            self.now += 0.01
+            chunk, self.pending = self.pending[:size], self.pending[size:]
+            return chunk
+
+    peer = Peer()
+    monkeypatch.setattr(link_module, "time", SimpleNamespace(monotonic=lambda: peer.now))
+    result = Link(peer).recv_line(2, KeepAlive(0.1, 0.5, beacon_interval=0.05))
+    assert result == "GET OK.BIN https://example.com/ok"
+
+
 def test_stale_pong_does_not_confirm_latest_probe():
     pipe = PipePair()
     pipe.left.read_timeout = pipe.right.read_timeout = 0.005

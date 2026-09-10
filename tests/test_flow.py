@@ -68,7 +68,7 @@ def transfer(tmp_path, *, size=1537, fault="none", block=256, window=2, payload_
     server = PcutpServer(
         Link(pipe.left), fetcher=lambda url, **kw: Fetched(payload, url),
         block_size=block, window_size=window, connect_delay=0, ack_timeout=0.1,
-        probe_guard=0.01, probe_timeout=0.01,
+        probe_guard=0.01, probe_timeout=0.1,
     )
     client = PcutpClient(Link(pipe.right), tmp_path)
 
@@ -412,3 +412,114 @@ def test_reference_receiver_keeps_meta_across_sender_reset(tmp_path):
     assert result[0].ok
     assert (tmp_path / "RESET.BIN").read_bytes() == payload
     assert not (tmp_path / "RESET.BIN.PCUTP").exists()
+
+
+def test_identity_is_negotiated_without_flow():
+    from pcutp.sound import Sound
+
+    class Peer:
+        sound = Sound(enabled=False)
+        sent = []
+        replies = iter(["HRU", "IAM 0 TYPE=PYTHON"])
+
+        def send_line(self, line):
+            self.sent.append(line)
+
+        def recv_line(self, timeout):
+            return next(self.replies)
+
+        def log(self, line):
+            pass
+
+    peer = Peer()
+    assert PcutpServer(peer)._handle_hello("HELLO PCUTP/2 IDENTITY=1")
+    assert "IDENTITY=1" in peer.sent[0].split()
+    assert "FLOW=1" not in peer.sent[0].split()
+    assert peer.sent[1] == "WHO? 0"
+
+
+def test_stale_here_does_not_spend_current_probe_retry():
+    from pcutp.errors import TimeoutError_
+
+    class Peer:
+        sent = []
+        replies = iter(["HERE 0 1", "HERE 1 1"])
+
+        def send_line(self, line):
+            self.sent.append(line)
+
+        def recv_line(self, timeout):
+            if not self.sent:
+                raise TimeoutError_("guard")
+            return next(self.replies)
+
+    peer = Peer()
+    server = PcutpServer(peer, probe_retries=1)
+    assert server._probe_receiver(0) == "DROP 1 1"
+    assert peer.sent == ["AYT? 1"]
+
+
+def test_recovery_drains_duplicate_reset_ack_and_delayed_here():
+    class Peer:
+        replies = iter(["RST-ACK 11 0", "HERE 10 1", "RESUME 12 0"])
+
+        def send_line(self, line):
+            assert line == "BARRIER 12"
+
+        def recv_line(self, timeout):
+            return next(self.replies)
+
+    server = PcutpServer(Peer())
+    server._barrier_id = 11
+    server._reset_token = "11"
+    assert server._recover_window(0, 1) == 0
+
+
+def test_flow_receiver_waits_for_full_reset_budget(tmp_path):
+    from pcutp.errors import TimeoutError_
+
+    class Peer:
+        def send_line(self, line):
+            assert line == "READY"
+
+        def recv_line(self, timeout):
+            budget = (const.ACK_TIMEOUT + const.PROBE_GUARD
+                      + (const.PROBE_RETRIES + const.RST_RETRIES) * const.PROBE_TIMEOUT)
+            assert timeout > budget
+            raise TimeoutError_("end test")
+
+    client = PcutpClient(Peer(), tmp_path)
+    client.flow = True
+    with pytest.raises(TimeoutError_, match="end test"):
+        client._receive(Meta("WAIT.BIN", 1, 64, 1, crc32_hex(b"x")))
+
+
+def test_delayed_rmb_replies_do_not_abort_a_transfer():
+    from pcutp.sound import Sound
+
+    checksum = crc32_hex(b"x")
+
+    class Peer:
+        sound = Sound(enabled=False)
+        sent = []
+        replies = iter([
+            "RMB 0 NONE - 0 0 00000000", "READY",
+            "RMB 1 ACTIVE X.BIN 1 0 " + checksum, "ACK 0", "OK " + checksum,
+        ])
+
+        def send_line(self, line):
+            self.sent.append(line)
+
+        def send_line_and_raw(self, line, data):
+            self.sent.append(line)
+
+        def recv_line(self, timeout):
+            return next(self.replies)
+
+        def log(self, line):
+            pass
+
+    peer = Peer()
+    assert PcutpServer(peer).send_file("X.BIN", b"x").verified
+    assert "RMB-ACK 0" in peer.sent
+    assert "RMB-ACK 1" in peer.sent

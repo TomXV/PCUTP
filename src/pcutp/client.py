@@ -179,7 +179,9 @@ class PcutpClient:
         self._write_rmb(checkpoint, meta, "ACTIVE", expected, received, running)
         with open(part, "wb") as handle:
             while True:
-                header = self.link.recv_line(const.ACK_TIMEOUT * 2)
+                header = self.link.recv_line(
+                    const.RECOVERY_TIMEOUT if self.flow else const.ACK_TIMEOUT * 2
+                )
                 self._raise_for_err(header)
                 parts = header.split()
                 if len(parts) == 2 and parts[0] == "AYT?" and parts[1].isdecimal():

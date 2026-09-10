@@ -72,6 +72,7 @@ class PcutpServer:
         self.window_size = 1
         self.flow = False
         self._barrier_id = 0
+        self._reset_token: str | None = None
         self.compression_enabled = compression
         self.probe_guard = probe_guard
         self.probe_timeout = probe_timeout
@@ -98,6 +99,19 @@ class PcutpServer:
         self._pending: str | None = None
 
     # -- top level -------------------------------------------------------
+    def _recv_line(self, timeout: float, **kwargs) -> str:
+        """Drain delayed control replies even after an idle GET starts a transfer."""
+        deadline = time.monotonic() + timeout
+        while True:
+            line = self.link.recv_line(max(0, deadline - time.monotonic()), **kwargs)
+            parts = line.split()
+            if len(parts) < 2 or parts[0] != "RMB" or parts[1] not in {"0", "1"}:
+                return line
+            self.link.send_line(f"RMB-ACK {parts[1]}")
+            self.link.log(f"RMB state: {line}")
+            if time.monotonic() >= deadline:
+                raise TimeoutError_("only control replies received")
+
     def serve_once(self, timeout: float = const.LINE_TIMEOUT,
                    on_idle: "Callable[[], None] | None" = None) -> None:
         """Three-way HELLO/HELLO-HRU?/HRU handshake, then serve GETs.
@@ -108,19 +122,14 @@ class PcutpServer:
         to IDLE); a fresh HELLO mid-session re-runs the handshake.
         """
         self._pending = None
-        line = self.link.recv_line(timeout)
+        line = self._recv_line(timeout)
         if not self._handle_hello(line):
             return
         while True:
             if self._pending is not None:
                 request, self._pending = self._pending, None
             else:
-                request = self.link.recv_line(timeout, keepalive=self.keepalive, on_idle=on_idle)
-            parts = request.split()
-            if len(parts) >= 2 and parts[0] == "RMB" and parts[1] in {"0", "1"}:
-                self.link.send_line(f"RMB-ACK {parts[1]}")
-                self.link.log(f"RMB state: {request}")
-                continue
+                request = self._recv_line(timeout, keepalive=self.keepalive, on_idle=on_idle)
             if request == "CLOSE":
                 # The peer has stopped sending requests. Acknowledge that half,
                 # then close this one: nothing is in flight here, because a GET
@@ -182,8 +191,8 @@ class PcutpServer:
             extra = f" FLOW=1 WINDOW={self.window_size}"
             if self.compression:
                 extra += " LZ4=1"
-            if self.identity:
-                extra += " IDENTITY=1"
+        if self.identity:
+            extra += " IDENTITY=1"
         proposal_tail = (f"{const.PROTOCOL_VERSION} BAUD={self.baud} "
                          f"MAXBLK={self.block_size}{extra}")
         proposal = (("HELLO " + const.PROTOCOL_VERSION + " HRU? "
@@ -194,7 +203,7 @@ class PcutpServer:
         self.link.sound.handshake_carrier()
         deadline = time.monotonic() + const.HANDSHAKE_TIMEOUT
         while True:
-            reply = self.link.recv_line(max(0, deadline - time.monotonic()))
+            reply = self._recv_line(max(0, deadline - time.monotonic()))
             if reply.startswith((f"HELLO {const.PROTOCOL_VERSION}",
                                  f"HELLO? {const.PROTOCOL_VERSION}")):
                 self.link.send_line("OHRU " + proposal_tail)
@@ -207,7 +216,7 @@ class PcutpServer:
         self.link.sound.handshake_connected()
         if self.identity:
             self.link.send_line("WHO? 0")
-            iam = self.link.recv_line(const.HANDSHAKE_TIMEOUT).split()
+            iam = self._recv_line(const.HANDSHAKE_TIMEOUT).split()
             if len(iam) < 3 or iam[:2] != ["IAM", "0"] or not iam[2].startswith("TYPE="):
                 raise ProtocolError("invalid IAM response")
             self.link.log("peer identity: " + " ".join(iam[2:]))
@@ -273,7 +282,7 @@ class PcutpServer:
             f"META {filename} {size} {self.block_size} {blocks} {file_crc}"
         )
 
-        reply = self.link.recv_line(self.ack_timeout)
+        reply = self._recv_line(self.ack_timeout)
         if reply != "READY":
             # ERR STORAGE and friends: the client declined, nothing to clean up.
             return None
@@ -295,7 +304,7 @@ class PcutpServer:
         self.link.send_line(f"DONE {file_crc}")
         deadline = time.monotonic() + self.ack_timeout
         while True:
-            final = self.link.recv_line(max(0, deadline - time.monotonic()))
+            final = self._recv_line(max(0, deadline - time.monotonic()))
             parts = final.split()
             if (self.flow and len(parts) == 2 and parts[0] == "ACK"
                     and parts[1].isdecimal() and int(parts[1]) < blocks):
@@ -356,7 +365,7 @@ class PcutpServer:
             deadline = time.monotonic() + self.ack_timeout
             while True:
                 try:
-                    reply = self.link.recv_line(max(0, deadline - time.monotonic()))
+                    reply = self._recv_line(max(0, deadline - time.monotonic()))
                 except TimeoutError_:
                     cwnd = 1
                     clean_acks = 0
@@ -431,7 +440,7 @@ class PcutpServer:
         fresh BARRIER/RESUME boundary before more DATA is sent.
         """
         try:
-            late = self.link.recv_line(self.probe_guard)
+            late = self._recv_line(self.probe_guard)
             if late:
                 return late
         except TimeoutError_:
@@ -443,18 +452,19 @@ class PcutpServer:
             self._barrier_id += 1
             probe = str(self._barrier_id)
             self.link.send_line(f"AYT? {probe}")
-            try:
-                parts = self.link.recv_line(self.probe_timeout).split()
-            except TimeoutError_:
-                continue
-            if (len(parts) == 3 and parts[:2] == ["HERE", probe]
-                    and parts[2].isdecimal()):
-                next_seq = int(parts[2])
-                if next_seq < 0:
-                    raise ProtocolError("invalid HERE sequence")
-                return f"DROP {next_seq} {next_seq}"
-            if parts and parts[0] in {"ACK", "NAK", "DROP", "RST", "ERR"}:
-                return " ".join(parts)
+            deadline = time.monotonic() + self.probe_timeout
+            while time.monotonic() < deadline:
+                try:
+                    parts = self._recv_line(deadline - time.monotonic()).split()
+                except TimeoutError_:
+                    break
+                if (len(parts) == 3 and parts[:2] == ["HERE", probe]
+                        and parts[2].isdecimal()):
+                    next_seq = int(parts[2])
+                    return f"DROP {next_seq} {next_seq}"
+                if parts and parts[0] in {"ACK", "NAK", "DROP", "RST", "ERR"}:
+                    return " ".join(parts)
+                # A delayed answer does not spend the current probe's budget.
         # The AYT? exchange found no live receiver.  Do not turn that into a
         # new HELLO session: RST is a transfer-local request to discard the
         # partial file and restart this META at sequence zero.  Its token makes
@@ -466,10 +476,11 @@ class PcutpServer:
             deadline = time.monotonic() + self.probe_timeout
             while time.monotonic() < deadline:
                 try:
-                    parts = self.link.recv_line(deadline - time.monotonic()).split()
+                    parts = self._recv_line(deadline - time.monotonic()).split()
                 except TimeoutError_:
                     break
                 if parts == ["RST-ACK", token, "0"]:
+                    self._reset_token = token
                     return "RST 0"
                 # These may be delayed answers to the flight that timed out.
                 # The reset confirmation is the only answer that commits a
@@ -491,14 +502,16 @@ class PcutpServer:
             deadline = time.monotonic() + self.ack_timeout
             while time.monotonic() < deadline:
                 try:
-                    parts = self.link.recv_line(deadline - time.monotonic()).split()
+                    parts = self._recv_line(deadline - time.monotonic()).split()
                 except TimeoutError_:
                     break
                 if len(parts) == 3 and parts[:2] == ["RESUME", token]:
                     if not parts[2].isdecimal() or not base <= int(parts[2]) <= sent:
                         raise ProtocolError("invalid recovery sequence")
                     return int(parts[2])
-                if parts and parts[0] in {"ACK", "NAK", "DROP", "RESUME"}:
+                if parts == ["RST-ACK", self._reset_token, "0"]:
+                    continue  # a retransmitted reset can have a second receipt
+                if parts and parts[0] in {"ACK", "NAK", "DROP", "RESUME", "HERE"}:
                     continue
                 raise ProtocolError(f"unexpected recovery reply: {parts!r}")
         raise TimeoutError_("recovery barrier was not acknowledged")
@@ -511,7 +524,7 @@ class PcutpServer:
             self.link.send_line_and_raw(header, chunk)
             self.data_wire_bytes += len(header) + 1 + len(chunk)
             try:
-                reply = self.link.recv_line(self.ack_timeout)
+                reply = self._recv_line(self.ack_timeout)
             except TimeoutError_ as exc:
                 timeouts += 1
                 if timeouts >= const.MAX_TIMEOUTS:
