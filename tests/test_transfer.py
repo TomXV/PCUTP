@@ -219,6 +219,51 @@ def test_server_repeats_proposal_for_duplicate_hello():
     assert accepted == [True]
 
 
+def test_server_accepts_first_get_when_final_hru_was_lost():
+    pipe = PipePair()
+    pipe.left.read_timeout = pipe.right.read_timeout = 0.01
+    server = PcutpServer(Link(pipe.left), connect_delay=0.0)
+    peer = Link(pipe.right)
+    accepted = []
+
+    def server_side():
+        accepted.append(server._handle_hello(server.link.recv_line(5.0)))
+
+    thread = threading.Thread(target=server_side)
+    thread.start()
+    peer.send_line("HELLO PCUTP/2 FLOW=1 MAXBLK=4096 WINDOW=1 RXBUF=16384")
+    assert peer.recv_line(5.0).startswith("HELLO PCUTP/2 HRU? ")
+    # The client has already moved on to its first request; HRU was lost.
+    peer.send_line("GET LOST.BIN https://example.com/lost.bin")
+    thread.join(5)
+
+    assert accepted == [True]
+    assert server._pending == "GET LOST.BIN https://example.com/lost.bin"
+
+
+def test_identity_client_retries_a_lost_hru(tmp_path):
+    pipe = PipePair()
+    pipe.left.read_timeout = pipe.right.read_timeout = 0.005
+    client = PcutpClient(Link(pipe.right), dest_dir=tmp_path)
+    peer = Link(pipe.left)
+
+    def server_side():
+        assert peer.recv_line(5.0).startswith("HELLO PCUTP/2 ")
+        peer.send_line(
+            "HELLO PCUTP/2 HRU? BAUD=115200 MAXBLK=512 IDENTITY=1"
+        )
+        assert peer.recv_line(5.0) == "HRU"
+        # Drop the first acknowledgement and wait for the client's retry.
+        assert peer.recv_line(5.0) == "HRU"
+        peer.send_line("WHO? 0")
+        assert peer.recv_line(5.0).startswith("IAM 0 TYPE=PYTHON")
+
+    thread = threading.Thread(target=server_side)
+    thread.start()
+    assert client.hello(timeout=0.02) == 512
+    thread.join(5)
+
+
 def test_three_way_handshake_server_rejects_non_hru_ack(tmp_path):
     pipe = PipePair()
     pipe.left.read_timeout = pipe.right.read_timeout = 0.01
@@ -380,6 +425,67 @@ def test_malformed_meta_is_reported_as_protocol_error(tmp_path, line):
     server.send_line(line)
     with pytest.raises(ProtocolError):
         client._recv_meta(1.0)
+
+
+def test_non_flow_raw_timeout_uses_nak_and_can_recover(tmp_path, monkeypatch):
+    monkeypatch.setattr(const, "DATA_TIMEOUT", 0.05)
+    pipe = PipePair()
+    pipe.left.read_timeout = pipe.right.read_timeout = 0.01
+    client = PcutpClient(Link(pipe.right), dest_dir=tmp_path, compression=False)
+    client.flow = False
+    peer = Link(pipe.left)
+    payload = b"abcd"
+    crc = crc32_hex(payload)
+
+    def server_side():
+        peer.send_line(f"META X.BIN 4 4 1 {crc}")
+        assert peer.recv_line(5.0) == "READY"
+        peer.send_line("DATA 0 4 " + crc)
+        assert peer.recv_line(5.0) == "NAK 0 RAW"
+        peer.send_line_and_raw("DATA 0 4 " + crc, payload)
+        assert peer.recv_line(5.0) == "ACK 0"
+        peer.send_line("DONE " + crc)
+        assert peer.recv_line(5.0) == "OK " + crc
+
+    thread = threading.Thread(target=server_side)
+    thread.start()
+    meta = client._recv_meta(1.0)
+    download = client._receive(meta)
+    thread.join(5)
+
+    assert download.ok
+    assert download.path.read_bytes() == payload
+
+
+def test_shutdown_aborts_a_transfer_without_sending_close():
+    class FakeLink:
+        def __init__(self):
+            self.sent = []
+            self.fin_called = False
+
+        def send_line(self, line):
+            self.sent.append(line)
+
+        def send_fin(self):
+            self.fin_called = True
+
+        def await_fin(self):
+            raise AssertionError("must not await FIN during a transfer")
+
+        def linger(self):
+            raise AssertionError("must not linger during a transfer")
+
+    link = FakeLink()
+    server = PcutpServer(link, connect_delay=0.0)
+    server._transfer_active = True
+    server.shutdown()
+    assert link.sent == ["ERR RETRY"]
+    assert not link.fin_called
+
+    link.sent.clear()
+    server._raw_write_active = True
+    server.shutdown()
+    assert link.sent == []
 
 
 def test_fetch_window_outlasts_the_fetch_itself():

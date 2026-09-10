@@ -97,6 +97,11 @@ class PcutpServer:
         )
         # A line read but not yet consumed; serve_once takes it next time.
         self._pending: str | None = None
+        # Set while a GET is fetching or sending.  KeyboardInterrupt must
+        # leave these flags set so shutdown does not put a control line in the
+        # middle of an interrupted raw payload.
+        self._transfer_active = False
+        self._raw_write_active = False
 
     # -- top level -------------------------------------------------------
     def _recv_line(self, timeout: float, **kwargs) -> str:
@@ -146,7 +151,15 @@ class PcutpServer:
                 if not self._handle_hello(request):
                     return
                 continue
-            result = self._handle_get(request)
+            self._transfer_active = True
+            try:
+                result = self._handle_get(request)
+            except PcutpError:
+                self._transfer_active = False
+                self._raw_write_active = False
+                raise
+            else:
+                self._transfer_active = False
             if result is not None and self.on_result is not None:
                 self.on_result(result)
 
@@ -158,6 +171,17 @@ class PcutpServer:
         "Disconnected" and it printing "Link lost" ten seconds later: a clean
         shutdown should not be reported as a fault.
         """
+        if self._transfer_active:
+            # A graceful CLOSE describes a completed transfer.  During an
+            # interrupted fetch or ACK wait, tell the receiver to abort; during
+            # a raw write, any new bytes would corrupt framing, so close the
+            # transport in the daemon's finally block instead.
+            if not self._raw_write_active:
+                try:
+                    self.link.send_line("ERR RETRY")
+                except PcutpError:
+                    pass
+            return
         try:
             self.link.send_fin()
             self.link.await_fin()
@@ -202,23 +226,49 @@ class PcutpServer:
         self.link.sound.handshake_ring()
         self.link.sound.handshake_carrier()
         deadline = time.monotonic() + const.HANDSHAKE_TIMEOUT
-        while True:
-            reply = self._recv_line(max(0, deadline - time.monotonic()))
+        for hru_attempt in range(const.HELLO_RETRIES):
+            try:
+                reply = self._recv_line(max(0, deadline - time.monotonic()))
+            except TimeoutError_:
+                if hru_attempt == const.HELLO_RETRIES - 1:
+                    self._fail(TimeoutError_("timed out waiting for HRU"))
+                    return False
+                # A lost HRU leaves the peer waiting for WHO? (or GET).  Keep
+                # the same proposal alive while it retries that final ACK.
+                self.link.send_line("OHRU " + proposal_tail)
+                deadline = time.monotonic() + const.HANDSHAKE_TIMEOUT
+                continue
             if reply.startswith((f"HELLO {const.PROTOCOL_VERSION}",
                                  f"HELLO? {const.PROTOCOL_VERSION}")):
                 self.link.send_line("OHRU " + proposal_tail)
                 deadline = time.monotonic() + const.HANDSHAKE_TIMEOUT
                 continue
             break
-        if reply != "HRU":
-            self._fail(ProtocolError(f"expected HRU, got {reply!r}"))
+        else:
+            self._fail(TimeoutError_("timed out waiting for HRU"))
             return False
+        if reply != "HRU":
+            # A no-identity peer sends its first GET immediately after HRU.
+            # Treat that request as an implicit acknowledgement so a lost HRU
+            # cannot strand an otherwise valid session.
+            if not self.identity and reply.startswith("GET "):
+                self._pending = reply
+            else:
+                self._fail(ProtocolError(f"expected HRU, got {reply!r}"))
+                return False
         self.link.sound.handshake_connected()
         if self.identity:
-            self.link.send_line("WHO? 0")
-            iam = self._recv_line(const.HANDSHAKE_TIMEOUT).split()
-            if len(iam) < 3 or iam[:2] != ["IAM", "0"] or not iam[2].startswith("TYPE="):
+            for _ in range(const.HELLO_RETRIES):
+                self.link.send_line("WHO? 0")
+                iam = self._recv_line(const.HANDSHAKE_TIMEOUT).split()
+                if iam == ["HRU"]:
+                    continue
+                if (len(iam) >= 3 and iam[:2] == ["IAM", "0"]
+                        and iam[2].startswith("TYPE=")):
+                    break
                 raise ProtocolError("invalid IAM response")
+            else:
+                raise TimeoutError_("identity handshake was not acknowledged")
             self.link.log("peer identity: " + " ".join(iam[2:]))
         # A fresh session restarts the idle heartbeat and probe numbering so a
         # session does not inherit the counters of the one before it. Guarded
@@ -359,7 +409,9 @@ class PcutpServer:
                     else:
                         frames[next_seq] = f"DATA {next_seq} {len(chunk)} {crc32_hex(chunk)}", chunk
                 header, payload = frames[next_seq]
+                self._raw_write_active = True
                 self.link.send_line_and_raw(header, payload)
+                self._raw_write_active = False
                 self.data_wire_bytes += len(header) + 1 + len(payload)
                 next_seq += 1
             deadline = time.monotonic() + self.ack_timeout
@@ -521,7 +573,9 @@ class PcutpServer:
         timeouts = 0
         for attempt in range(self.max_retries + 1):
             header = f"DATA {seq} {len(chunk)} {crc32_hex(chunk)}"
+            self._raw_write_active = True
             self.link.send_line_and_raw(header, chunk)
+            self._raw_write_active = False
             self.data_wire_bytes += len(header) + 1 + len(chunk)
             try:
                 reply = self._recv_line(self.ack_timeout)

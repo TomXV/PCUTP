@@ -104,10 +104,26 @@ class PcutpClient:
             raise ProtocolError("sender exceeded receiver capabilities")
         self.link.send_line("HRU")
         if self.identity:
-            who = self.link.recv_line(timeout).split()
-            if who != ["WHO?", "0"]:
+            # HRU is the final handshake acknowledgement.  If that one line
+            # is lost, the server is still waiting for it while we wait for
+            # WHO?; resend HRU on each timeout and accept a retransmitted
+            # proposal as the same negotiation.
+            for attempt in range(const.HELLO_RETRIES):
+                try:
+                    who = self.link.recv_line(timeout).split()
+                except TimeoutError_:
+                    if attempt == const.HELLO_RETRIES - 1:
+                        raise
+                    self.link.send_line("HRU")
+                    continue
+                if who == ["WHO?", "0"]:
+                    self.link.send_line("IAM 0 TYPE=PYTHON ROLE=CLIENT VER=2.1")
+                    break
+                if (who[:3] == ["HELLO", const.PROTOCOL_VERSION, "HRU?"]
+                        or who[:2] == ["OHRU", const.PROTOCOL_VERSION]):
+                    self.link.send_line("HRU")
+                    continue
                 raise ProtocolError("expected WHO? 0")
-            self.link.send_line("IAM 0 TYPE=PYTHON ROLE=CLIENT VER=2.1")
         self.peer_closing = False
         return maxblk
 
@@ -250,7 +266,9 @@ class PcutpClient:
                     payload = self.link.recv_exact(length, const.DATA_TIMEOUT)
                 except TimeoutError_:
                     self.link.discard_input()
-                    self.link.send_line(f"DROP {expected} RAW")
+                    self.link.send_line(
+                        f"{'DROP' if self.flow else 'NAK'} {expected} RAW"
+                    )
                     continue
                 if packed:
                     try:
@@ -291,6 +309,7 @@ class PcutpClient:
                 running = crc32(payload, running)
                 received += len(payload)
                 expected += 1
+                drops = 0
                 self.link.send_line(f"ACK {seq}")
                 if expected == meta.blocks or expected % 8 == 0:
                     self._write_rmb(checkpoint, meta, "ACTIVE", expected, received, running)

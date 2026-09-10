@@ -3,6 +3,7 @@
 import argparse
 import os
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -34,9 +35,15 @@ class ControlSocket:
     def __init__(self, path: str):
         self.path = path
         try:
-            os.unlink(path)
+            mode = os.lstat(path).st_mode
         except FileNotFoundError:
-            pass
+            mode = None
+        if mode is not None:
+            if not stat.S_ISSOCK(mode):
+                raise FileExistsError(
+                    f"control socket path exists and is not a socket: {path}"
+                )
+            os.unlink(path)
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.socket.bind(path)
         self.socket.setblocking(False)
@@ -53,7 +60,8 @@ class ControlSocket:
     def close(self) -> None:
         self.socket.close()
         try:
-            os.unlink(self.path)
+            if stat.S_ISSOCK(os.lstat(self.path).st_mode):
+                os.unlink(self.path)
         except FileNotFoundError:
             pass
 

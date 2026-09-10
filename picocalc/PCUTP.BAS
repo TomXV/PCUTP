@@ -227,6 +227,10 @@ Do
   Loop Until ValidName(fn$)
   If fn$ = "" Then Print "Cancelled.": Continue Do
 
+  ' A new GET starts a fresh in-memory report.  Clear the previous completed
+  ' or failed file before any fetch can fail and return to the prompt.
+  rmbState$ = "FETCHING": size = 0: blksz = 0: blocks = 0: seq = 0: rcvd = 0: fcrc = 0: running = 0
+
   Tone1 HZ_TX_GET, MS_WORD
   Print #1, "GET " + fn$ + " " + url$
 
@@ -236,14 +240,14 @@ Do
   ' link-loss window for that one wait. A uConsole that does not send it
   ' still works - META simply arrives here instead.
   s$ = RecvLine$(HSTMO)
-  If Left$(s$, 3) = "ERR" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print s$: Continue Do
+  If Left$(s$, 3) = "ERR" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print s$: rmbState$ = "NONE": size = 0: blksz = 0: blocks = 0: seq = 0: rcvd = 0: fcrc = 0: running = 0: Continue Do
   If s$ = "FETCHING" Then
     Tone1 HZ_RX_FETCH, MS_WORD
     Print "Fetching..."
     kaWin = FETTMO
     s$ = RecvLine$(FETTMO)
     kaWin = KATMO
-    If Left$(s$, 3) = "ERR" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print s$: Continue Do
+    If Left$(s$, 3) = "ERR" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print s$: rmbState$ = "NONE": size = 0: blksz = 0: blocks = 0: seq = 0: rcvd = 0: fcrc = 0: running = 0: Continue Do
   EndIf
   Split s$, meta$()                       ' META name size blksz blocks crc
   If meta$(0) <> "META" Then Tone1 HZ_RX_ERR, MS_WORD: SndFail: Print "protocol error": End
@@ -378,6 +382,7 @@ Do
     Loop
     running = crcRunningOut
     seq = seq + 1
+    drops = 0
     ' Count the bytes actually taken, not seq*blksz - the last block is short,
     ' which made the counter overshoot the file size.
     rcvd = rcvd + ln
@@ -426,6 +431,7 @@ Do
   SndDone
   Print "Saved:"
   Print fn$
+  If peerDone Then CloseSession : End
 Loop
 
 ' ---- teardown (section 6 of docs/PCUTP-0.2.md) -----------------------
