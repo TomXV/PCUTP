@@ -1,6 +1,6 @@
 # PCUTP
 
-**PicoCalc / uConsole UART File Transfer Protocol** — v0.1
+**PicoCalc / uConsole UART File Transfer Protocol** — v2.1
 
 PCUTPは、**インターネット接続機能を持たないデバイスに、UART経由でネットワーク機能を持たせるための軽量プロトコル**です。
 
@@ -23,7 +23,12 @@ PicoCalc
 SDカード
 ```
 
-完全なプロトコル仕様は [`docs/PCUTP-0.1.md`](docs/PCUTP-0.1.md) を参照してください。
+フロー制御・MTU自動選択・LZ4圧縮、実測結果を含む現行仕様は
+[`docs/PCUTP-0.2.md`](docs/PCUTP-0.2.md) を参照してください。
+ワイヤバージョンは `PCUTP/2` です。
+
+基本転送のプロトコル仕様は [`docs/PCUTP-0.2.md`](docs/PCUTP-0.2.md) を参照してください。
+旧版は [`docs/PCUTP-0.1.md`](docs/PCUTP-0.1.md) に残してあります。
 
 ## このプロジェクトは何ですか？
 
@@ -197,6 +202,23 @@ PCUTPから見て重要なのは、
 
 Linuxなら `/dev/ttyUSB0` や `/dev/ttyACM0`、Windowsなら `COM3` のように、PCUTPから通常のシリアルポートとして扱える状態になれば利用できます。
 
+Linux/uConsoleでは、リポジトリ内のスクリプトからデーモンをscreenへ起動できます。
+
+```bash
+./scripts/pcutpd.sh             # 起動（二重起動はしない）
+./scripts/pcutpd.sh status      # 状態確認
+./scripts/pcutpd.sh restart     # 再起動
+./scripts/pcutpd.sh log         # ログを追跡
+./scripts/pcutpd.sh stop        # 停止
+```
+
+既定値は `/dev/ttyACM0`、115200 baud、WINDOW=2、BLOCK=4096、trace・sound有効。
+たとえば別ポートなら `PCUTP_PORT=/dev/ttyUSB1 ./scripts/pcutpd.sh` と指定できます。
+
+ファイル転送前に配線とプロトコルだけを確認する場合は、PicoCalcへ
+`picocalc/PCTEST.BAS`を配置して実行します。GP4/GP5/GND、3-way handshake、双方向
+BEACON、番号付きPING/PONG、CLOSE/BYEを順番に検査し、成功時は`PASS`を表示します。
+
 そのため、たとえば以下のような構成が考えられます。
 
 - 一般的なUSB-UARTドングル
@@ -264,7 +286,9 @@ PCUTPでは、**制御情報はASCIIテキスト、ファイル本体はRAWバ�
 たとえば制御メッセージは、
 
 ```text
-HELLO PCUTP/1
+HELLO PCUTP/2 FLOW=1 MAXBLK=4096 WINDOW=2 RXBUF=16384 LZ4=1
+HELLO PCUTP/2 HRU? BAUD=115200 MAXBLK=4096 FLOW=1 WINDOW=1 LZ4=1
+HRU
 GET TEST.BAS https://example.com/test.bas
 META TEST.BAS 18342 4096 5 8B58A921
 DATA 0 4096 4A91F33C
@@ -362,34 +386,64 @@ TEST.BAS
 
 ## 現在のプロトコル
 
-PCUTP v0.1では、現在以下の制御語を使用します。
+PCUTP/2（実装v2.1）では、以下の制御語を使用します。
 
 ```text
-HELLO
-GET
-META
-READY
-DATA
-ACK
-NAK
-DONE
-OK
-ERR
+接続         HELLO     SYN: 挨拶と受信能力の提案
+             HRU?      SYN-ACK: 選択した条件の確認
+             HRU       ACK: 合意して通信開始
+
+転送         GET       ダウンロード要求
+             FETCHING  受理。これからインターネットに出る
+             META      ファイル情報（サイズ・ブロック数・CRC32）
+             READY     受信準備完了
+             DATA      データブロック（この後にRAWバイナリ）
+             ZDATA     圧縮データブロック（LZ4）
+             ACK       ブロック受領
+             NAK       ブロック再送要求
+             DONE      全ブロック送信完了
+             OK        ファイル全体のCRC32一致
+             ERR       エラー
+
+維持         PING n    番号付きアイドル生存確認（5秒間隔、最大3回）
+             PONG n    同じ番号による応答
+             BEACON    アイドル中の双方向ハートビート（U/P方向タグ付き）
+             AYT?      転送中の無応答に対する状態確認
+             HERE      生存応答と次に必要なシーケンス番号
+             CLOSE     正常切断
+             BYE       切断確認
+
+回復         BARRIER   先行データの読み切りを要求
+             RESUME    読み切り完了と次のシーケンス番号
 ```
+
+現行の接続語は `HELLO` `HELLO?` `HRU?` `OHRU` `HRU` です。通常時は
+`HELLO` → `HELLO ... HRU?` → `HRU`、聞き返し時は`HELLO?` → `OHRU` → `HRU`
+という、人間の挨拶として読めるTCP型3-way handshakeです。
+これにより、**1回の接続で複数のファイルを続けてダウンロードできる**ようになり
+（v0.1では1ファイルごとに接続をやり直していました）、
+回線が切れたことを検出できるようになりました。
+
+回線速度は **115200 baud 固定**です。かつて v0.2 は `RATE`/`PROBE` による速度
+ネゴシエーションを備えていましたが、実機検証で Flipper Zero の USB-UART ブリッジが
+115200 しか安定して通さない（短いプローブは速くても、4096 バイトの実ブロックが
+破損する）ことが分かったため、廃止しました。
 
 標準UART設定：
 
 ```text
-460800 baud
+115200 baud
 8 data bits
 No parity
 1 stop bit
 No flow control
 ```
 
-つまり **460800 8N1** です。
+つまり **115200 8N1** です。
 
-標準ブロックサイズは **4096 bytes** です。
+ブロック上限は **4096 bytes** です。既定ではファイル長・受信側上限・圧縮可能性から
+MTUを自動選択し、対応する相手には最大2ブロックを先行送信します。
+`--block 4096` で固定、`--window 1` で先行送信を停止、`--no-compression` で圧縮を停止できます。
 
 ## アーキテクチャ
 
@@ -442,7 +496,8 @@ PicoCalc側はPicoMite BASICで実装されています。
 | `picocalc/PCUTP.BAS` | PicoMite BASIC製のPicoCalc受信実装 |
 | `tests/` | インメモリUARTを使用した単体・E2Eテスト |
 | `Dockerfile` | ローカル・CI共通のビルド／テスト環境 |
-| `docs/PCUTP-0.1.md` | PCUTP v0.1 プロトコル仕様書 |
+| `docs/PCUTP-0.2.md` | PCUTP v0.2 プロトコル仕様書（現行） |
+| `docs/PCUTP-0.1.md` | PCUTP v0.1 プロトコル仕様書（旧版・参考） |
 
 ## 実機構成
 
@@ -452,7 +507,7 @@ PicoCalc側はPicoMite BASICで実装されています。
 PicoCalc Core GPIO
 GP4 / GP5
      │
-     │ UART 460800 8N1
+     │ UART 115200 8N1
      ▼
 uConsole
 ```
@@ -487,7 +542,8 @@ PYTHONPATH=src python3 -m pcutp.daemon ports    # 候補を一覧表示
 PYTHONPATH=src python3 -u -m pcutp.daemon serve --trace --sound
 ```
 
-`--trace` `--quiet` `--block` はサブコマンドの前後どちらに書いても構いません。音の一覧は `pcutp.daemon sounds` で名前付きで再生できます。
+`--trace` `--quiet` `--block` はサブコマンドの前後どちらに書いても構いません。音の一覧は `pcutp.daemon sounds`、全22制御語だけなら
+`pcutp.daemon sounds --words-only` で名前付きで再生できます。
 
 PicoCalc側（ランチャーがカレントを `B:/pico1-apps` にするため、フルパスで指定します）：
 

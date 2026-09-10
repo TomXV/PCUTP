@@ -1,21 +1,69 @@
 """pcutpd: the uConsole-side daemon and a hardware-free self test."""
 
 import argparse
+import os
+import socket
+import stat
 import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from . import __version__, const
 from . import sound as sound_mod
 from .client import PcutpClient
-from .errors import PcutpError
+from .errors import LinkLostError, PcutpError, TimeoutError_
 from .fetcher import Fetched
 from .link import Link
 from .server import PcutpServer
 from .sound import Sound
-from .transport import PipePair, SerialTransport
+from .transport import PipePair, SerialTransport, Transport
+
+# Two consecutive link failures are treated as a pulled cable: the first
+# failure could be an unclean peer shutdown, but the second one on the same
+# still-open port is almost always the Flipper gone from the USB bus.
+LINK_LOST_THRESHOLD = 2
+RECONNECT_INTERVAL = 1.0
+RECONNECT_SETTLE = 0.2
+
+
+class ControlSocket:
+    """Local datagram control plane; it never opens or writes the UART."""
+
+    def __init__(self, path: str):
+        self.path = path
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            mode = None
+        if mode is not None:
+            if not stat.S_ISSOCK(mode):
+                raise FileExistsError(
+                    f"control socket path exists and is not a socket: {path}"
+                )
+            os.unlink(path)
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.socket.bind(path)
+        self.socket.setblocking(False)
+
+    def commands(self) -> list[str]:
+        out = []
+        while True:
+            try:
+                data = self.socket.recv(64)
+            except BlockingIOError:
+                return out
+            out.append(data.decode("ascii", "replace").strip().upper())
+
+    def close(self) -> None:
+        self.socket.close()
+        try:
+            if stat.S_ISSOCK(os.lstat(self.path).st_mode):
+                os.unlink(self.path)
+        except FileNotFoundError:
+            pass
 
 
 class Console:
@@ -29,6 +77,8 @@ class Console:
     def __init__(self, show_bar: bool = True):
         self.show_bar = show_bar
         self._bar = ""
+        self._last_progress_at = 0.0
+        self._last_progress_bytes = 0
 
     def log(self, text: str) -> None:
         print(f"\r\033[K{text}" if self._bar else text, flush=True)
@@ -38,6 +88,12 @@ class Console:
     def progress(self, done: int, total: int) -> None:
         if not self.show_bar:
             return
+        now = time.monotonic()
+        if (done != total and done - self._last_progress_bytes < 65536
+                and now - self._last_progress_at < 0.25):
+            return
+        self._last_progress_at = now
+        self._last_progress_bytes = done
         pct = 100 if total == 0 else done * 100 // total
         filled = pct * 20 // 100
         bar = "#" * filled + "-" * (20 - filled)
@@ -49,6 +105,8 @@ class Console:
         if self._bar:
             print()
             self._bar = ""
+            self._last_progress_at = 0.0
+            self._last_progress_bytes = 0
         print(text, flush=True)
 
 
@@ -97,40 +155,164 @@ def run_ports(args: argparse.Namespace) -> int:
     return 0
 
 
+def wait_for_port(
+    port: str,
+    interval: float = RECONNECT_INTERVAL,
+    timeout: float | None = None,
+) -> bool:
+    """Poll for `port` to reappear; True once it exists, False on timeout.
+
+    The port path is fixed at startup (resolved from-by-id names vanish
+    with the device), so the presence check is a plain ``os.path.exists``.
+    None (the default) means poll forever, matching a daemon that should
+    stay up until the cable is re-plugged.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        if os.path.exists(port):
+            return True
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def reconnect(
+    transport: Transport,
+    link: Link,
+    port: str,
+    baud: int,
+    wait: "Callable[[str], bool] | None" = None,
+    log: "Callable[[str], None]" = print,
+) -> SerialTransport:
+    """Wait for the port to come back, then splice a fresh transport into `link`.
+
+    The successful path: ``transport.close()``, ``wait(port)`` until the
+    device reappears, a short settle so the Flipper's post-enumeration spam
+    is flushed, then ``discard_input()`` to drop that garbage before a new
+    handshake. Returns the new SerialTransport.
+    """
+    if wait is None:
+        wait = wait_for_port
+    while True:
+        log(f"waiting for {port}")
+        if not wait(port):
+            raise TimeoutError_(f"port did not reappear: {port}")
+        log(f"{port} present; reconnecting")
+        # USB enumeration can expose the path before the device can be opened,
+        # or the cable can disappear again between the check and the open.
+        time.sleep(RECONNECT_SETTLE)
+        try:
+            new_transport = SerialTransport(port, baud)
+        except OSError as exc:
+            log(f"serial not ready: {exc}")
+            time.sleep(RECONNECT_INTERVAL)
+            continue
+        link.t = new_transport
+        link.discard_input()
+        log(f"serial reconnected: {port}")
+        return new_transport
+
+
 def run_serial(args: argparse.Namespace) -> int:
+    from serial import SerialException
+
     port = resolve_port(args.port)
-    transport = SerialTransport(port, args.baud)
+    transport: SerialTransport = SerialTransport(port, args.baud)
     sound = Sound(enabled=args.sound)
     console = Console(show_bar=not args.quiet)
     link = Link(transport, trace=args.trace, sound=sound, log=console.log)
+    control = ControlSocket(args.control_socket)
+    control_bit = 0
+
+    def control_idle() -> None:
+        nonlocal control_bit
+        for command in control.commands():
+            if command == "RMB":
+                link.send_line(f"RMB? {control_bit}")
+                console.log(f"control: RMB? {control_bit}")
+                control_bit = 1 - control_bit
+            else:
+                console.log(f"control: ignored {command!r}")
+
+    def report(result) -> None:
+        status = "verified" if result.verified else "CRC MISMATCH"
+        console.done(
+            f"{result.filename}: {result.size} bytes in {result.blocks} blocks, "
+            f"{result.retransmits} retransmit(s), {status}"
+        )
+
     server = PcutpServer(
         link,
         block_size=args.block,
+        window_size=args.window,
+        compression=not args.no_compression,
         max_file_size=args.max_size,
+        baud=args.baud,
+        keepalive_interval=args.keepalive_interval,
+        keepalive_timeout=args.keepalive_timeout,
+        keepalive_retries=args.keepalive_retries,
+        beacon_interval=args.beacon_interval,
         on_progress=None if args.quiet else console.progress,
+        on_result=report,
     )
     print(f"pcutpd {__version__} on {port} @ {args.baud} 8N1 (Ctrl-C to stop)")
+    lost_streak = 0
     try:
         while True:
             try:
-                result = server.serve_once(timeout=args.idle_timeout)
+                server.serve_once(timeout=args.idle_timeout, on_idle=control_idle)
+                lost_streak = 0  # a clean session handshake resets the streak
+            except (SerialException, OSError):
+                # A dead port is unambiguous: the fd is gone or unreadable.
+                lost_streak = 0
+                console.done(f"serial disconnected on {port}; waiting for the cable")
+                transport.close()
+                transport = reconnect(
+                    transport, link, port, args.baud, log=console.done
+                )
+            except (LinkLostError, TimeoutError_) as exc:
+                lost_streak += 1
+                console.done(f"link lost ({exc.code}): {exc}")
+                if lost_streak < LINK_LOST_THRESHOLD:
+                    # The first loss can be an unclean peer shutdown (Ctrl-C
+                    # mid-session), not a pulled cable. Give the same port one
+                    # more chance before assuming a physical disconnect.
+                    link.discard_input()
+                    continue
+                console.done("detected disconnect; waiting for the port")
+                transport.close()
+                transport = reconnect(
+                    transport, link, port, args.baud, log=console.done
+                )
             except PcutpError as exc:
                 console.done(f"transfer failed: {exc}")
                 link.discard_input()
                 continue
-            if result is None:
-                continue
-            status = "verified" if result.verified else "CRC MISMATCH"
-            console.done(
-                f"{result.filename}: {result.size} bytes in {result.blocks} blocks, "
-                f"{result.retransmits} retransmit(s), {status}"
-            )
     except KeyboardInterrupt:
-        print("\nstopped")
+        # Say goodbye rather than just vanishing. Dropping the port leaves the
+        # receiver to discover the silence as a keep-alive failure ten seconds
+        # later and report a clean shutdown as "Link lost"; a CLOSE turns that
+        # into "Disconnected". Interrupting again skips it, for the case where
+        # the peer is already gone and the wait is just a wait.
+        print("\nclosing the session (Ctrl-C again to drop it)")
+        try:
+            server.shutdown()
+        except KeyboardInterrupt:
+            pass
+        print("stopped")
         return 0
     finally:
         sound.close()
+        control.close()
         transport.close()
+
+
+def _selftest_server(server: PcutpServer) -> None:
+    """Run serve_once until the session ends; link loss is a normal stop."""
+    try:
+        server.serve_once(timeout=10.0)
+    except LinkLostError:
+        pass
 
 
 def run_selftest(args: argparse.Namespace) -> int:
@@ -141,8 +323,11 @@ def run_selftest(args: argparse.Namespace) -> int:
         Link(pipe.left, trace=args.trace),
         fetcher=lambda url, max_size=const.MAX_FILE_SIZE: Fetched(payload, url),
         block_size=args.block,
+        connect_delay=0.0,
+        keepalive_interval=0.1,
+        keepalive_timeout=0.5,
     )
-    thread = threading.Thread(target=server.serve_once, kwargs={"timeout": 10.0})
+    thread = threading.Thread(target=_selftest_server, args=(server,))
     thread.start()
     with tempfile.TemporaryDirectory() as tmp:
         console = Console(show_bar=not args.quiet)
@@ -152,12 +337,15 @@ def run_selftest(args: argparse.Namespace) -> int:
             on_progress=None if args.quiet else console.progress,
         )
         client.hello()
-        download = client.get("SELFTEST.BIN", "https://example.invalid/selftest.bin")
-        thread.join()
+        first = client.get("SELFTEST.BIN", "https://example.invalid/selftest.bin")
+        second = client.get("SECOND.BIN", "https://example.invalid/second.bin")
+        client.close()
+        thread.join(5)
         print()
-        got = Path(download.path).read_bytes()
-        ok = download.ok and got == payload
-        print(f"selftest: {'OK' if ok else 'FAILED'} ({len(got)} bytes)")
+        got1 = Path(first.path).read_bytes()
+        got2 = Path(second.path).read_bytes()
+        ok = first.ok and second.ok and got1 == payload and got2 == payload
+        print(f"selftest: {'OK' if ok else 'FAILED'} ({len(got1)}+{len(got2)} bytes)")
         return 0 if ok else 1
 
 
@@ -177,6 +365,11 @@ def run_sounds(args: argparse.Namespace) -> int:
         print(f"  {word:<6} {hz:>4} Hz  {length}")
         sound.line(word)
         time.sleep(0.55)
+    if args.words_only:
+        ok = sound.active
+        print(f"audio underruns: {sound.underruns}")
+        sound.close()
+        return 0 if ok else 1
     print("\nthe internet leg (swept and noisy)")
     for name, label in (
         ("dial", "request going out"),
@@ -186,6 +379,24 @@ def run_sounds(args: argparse.Namespace) -> int:
         print(f"  {name:<8} {label}")
         sound.effect(name)
         time.sleep(0.9)
+    print("\nthe handshake (dial-up answer)")
+    for name, label in (
+        ("ring", "HOWRU answer tone"),
+        ("carrier", "CONNECT negotiation"),
+        ("connected", "CONNECT flourish"),
+    ):
+        print(f"  {name:<10} {label}")
+        getattr(sound, f"handshake_{name}")()
+        time.sleep(0.9)
+    print("\nsession effects")
+    for name, label in (
+        ("dial", "DTMF dialling out on HELLO"),
+        ("fanfare", "transfer verified"),
+        ("disconnect", "graceful hangup on CLOSE"),
+    ):
+        print(f"  {name:<10} {label}")
+        getattr(sound, name)()
+        time.sleep(0.9)
     for kind in sound_mod.NET_ERROR_HZ:
         print(f"  {kind:<10} fetch failed")
         sound.effect("err:" + kind)
@@ -193,6 +404,18 @@ def run_sounds(args: argparse.Namespace) -> int:
     time.sleep(1.0)
     sound.close()
     return 0
+
+
+def _block_size(value: str) -> int | None:
+    if value == "auto":
+        return None
+    try:
+        size = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("block must be auto or 1..4096") from exc
+    if not 1 <= size <= const.MAX_BLOCK_SIZE:
+        raise argparse.ArgumentTypeError("block must be auto or 1..4096")
+    return size
 
 
 def _shared(*, suppress: bool) -> argparse.ArgumentParser:
@@ -210,9 +433,9 @@ def _shared(*, suppress: bool) -> argparse.ArgumentParser:
     p.add_argument("--quiet", action="store_true", default=off, help="no progress bar")
     p.add_argument(
         "--block",
-        type=int,
-        default=argparse.SUPPRESS if suppress else const.DEFAULT_BLOCK_SIZE,
-        help="block size in bytes",
+        type=_block_size,
+        default=argparse.SUPPRESS if suppress else None,
+        help="block size in bytes, or auto (default: measured PicoCalc cost model)",
     )
     return p
 
@@ -233,9 +456,39 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="serial port, or 'auto' to pick the only USB adapter attached",
     )
-    serve.add_argument("--baud", type=int, default=const.DEFAULT_BAUDRATE)
+    serve.add_argument(
+        "--baud",
+        type=int,
+        default=const.BASE_BAUDRATE,
+        help="rate the handshake runs on, and the fallback when a faster one fails",
+    )
     serve.add_argument("--max-size", type=int, default=const.MAX_FILE_SIZE)
+    serve.add_argument("--no-compression", action="store_true", help="send raw blocks only")
+    serve.add_argument(
+        "--window", type=int, choices=(1, 2), default=2,
+        help="maximum unacknowledged blocks (limited by receiver capabilities)",
+    )
     serve.add_argument("--idle-timeout", type=float, default=3600.0)
+    serve.add_argument(
+        "--control-socket", default="/tmp/pcutpd.sock",
+        help="local datagram socket for pcutpctl commands",
+    )
+    serve.add_argument(
+        "--keepalive-interval", type=float, default=const.KEEPALIVE_INTERVAL,
+        help="idle seconds before sending a PING probe",
+    )
+    serve.add_argument(
+        "--keepalive-timeout", type=float, default=const.KEEPALIVE_TIMEOUT,
+        help="minimum silent seconds before declaring the link lost",
+    )
+    serve.add_argument(
+        "--keepalive-retries", type=int, default=const.KEEPALIVE_RETRIES,
+        help="unanswered numbered PING probes before declaring the link lost",
+    )
+    serve.add_argument(
+        "--beacon-interval", type=float, default=const.BEACON_INTERVAL,
+        help="seconds between directional idle BEACON heartbeats",
+    )
     serve.add_argument(
         "--sound",
         action="store_true",
@@ -250,6 +503,7 @@ def build_parser() -> argparse.ArgumentParser:
     test.set_defaults(func=run_selftest)
 
     tones = sub.add_parser("sounds", help="play and name every sound")
+    tones.add_argument("--words-only", action="store_true", help="play just the 22 control words")
     tones.set_defaults(func=run_sounds)
 
     ports = sub.add_parser("ports", help="list serial ports that could be the PicoCalc")

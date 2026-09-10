@@ -1,0 +1,27 @@
+[
+  {
+    "block": 4096,
+    "requested_block": null,
+    "window": 2,
+    "iteration": 0,
+    "size": 313786,
+    "seconds": 27.105278650997207,
+    "kib_s": 11.30523853196862,
+    "request_seconds": 27.11155973399582,
+    "retransmits": 0,
+    "crc32": "AE3D99A0",
+    "verified": true,
+    "program": "B:/PCFAST.BAS",
+    "corrupt_seq": -1,
+    "drop_ack": -1,
+    "barriers": 0,
+    "negotiated_window": 2,
+    "compression": "auto",
+    "compressed_blocks": 10,
+    "data_wire_bytes": 289689,
+    "fixture": "/home/tomxv/picocalc-tracker/assets/touhou_unowen.mod",
+    "sound": true,
+    "audio_events": 92,
+    "audio_max_render_delay_ms": 10.765131009975448
+  }
+]

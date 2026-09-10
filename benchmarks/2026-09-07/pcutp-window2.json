@@ -1,0 +1,110 @@
+[
+  {
+    "block": 1024,
+    "window": 2,
+    "iteration": 0,
+    "size": 32768,
+    "seconds": 3.097879521010327,
+    "kib_s": 10.329646386494616,
+    "retransmits": 0,
+    "crc32": "751F3E92",
+    "verified": true,
+    "program": "B:/PCFAST.BAS"
+  },
+  {
+    "block": 1024,
+    "window": 2,
+    "iteration": 1,
+    "size": 32768,
+    "seconds": 3.090784006009926,
+    "kib_s": 10.353360162915646,
+    "retransmits": 0,
+    "crc32": "751F3E92",
+    "verified": true,
+    "program": "B:/PCFAST.BAS"
+  },
+  {
+    "block": 1024,
+    "window": 2,
+    "iteration": 2,
+    "size": 32768,
+    "seconds": 3.085644355000113,
+    "kib_s": 10.370605396615394,
+    "retransmits": 0,
+    "crc32": "751F3E92",
+    "verified": true,
+    "program": "B:/PCFAST.BAS"
+  },
+  {
+    "block": 2048,
+    "window": 2,
+    "iteration": 0,
+    "size": 32768,
+    "seconds": 3.0991326280054636,
+    "kib_s": 10.325469684914557,
+    "retransmits": 0,
+    "crc32": "751F3E92",
+    "verified": true,
+    "program": "B:/PCFAST.BAS"
+  },
+  {
+    "block": 2048,
+    "window": 2,
+    "iteration": 1,
+    "size": 32768,
+    "seconds": 3.089698199997656,
+    "kib_s": 10.356998622073922,
+    "retransmits": 0,
+    "crc32": "751F3E92",
+    "verified": true,
+    "program": "B:/PCFAST.BAS"
+  },
+  {
+    "block": 2048,
+    "window": 2,
+    "iteration": 2,
+    "size": 32768,
+    "seconds": 3.0955342879897216,
+    "kib_s": 10.337472314280582,
+    "retransmits": 0,
+    "crc32": "751F3E92",
+    "verified": true,
+    "program": "B:/PCFAST.BAS"
+  },
+  {
+    "block": 4096,
+    "window": 2,
+    "iteration": 0,
+    "size": 32768,
+    "seconds": 3.1558060879906407,
+    "kib_s": 10.140040011259051,
+    "retransmits": 0,
+    "crc32": "751F3E92",
+    "verified": true,
+    "program": "B:/PCFAST.BAS"
+  },
+  {
+    "block": 4096,
+    "window": 2,
+    "iteration": 1,
+    "size": 32768,
+    "seconds": 3.144408812993788,
+    "kib_s": 10.17679376414571,
+    "retransmits": 0,
+    "crc32": "751F3E92",
+    "verified": true,
+    "program": "B:/PCFAST.BAS"
+  },
+  {
+    "block": 4096,
+    "window": 2,
+    "iteration": 2,
+    "size": 32768,
+    "seconds": 3.1592947209865088,
+    "kib_s": 10.128842930490451,
+    "retransmits": 0,
+    "crc32": "751F3E92",
+    "verified": true,
+    "program": "B:/PCFAST.BAS"
+  }
+]

@@ -1,0 +1,18 @@
+[
+  {
+    "block": 4096,
+    "window": 1,
+    "iteration": 0,
+    "size": 1048576,
+    "seconds": 124.8398285840085,
+    "kib_s": 8.202510461722714,
+    "retransmits": 0,
+    "crc32": "DBDA0728",
+    "verified": true,
+    "program": "B:/PCUTP.BAS",
+    "corrupt_seq": -1,
+    "drop_ack": -1,
+    "barriers": 0,
+    "negotiated_window": 1
+  }
+]

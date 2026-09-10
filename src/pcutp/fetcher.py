@@ -1,6 +1,7 @@
 """HTTP(S) fetching for the uConsole side (sections 7, 23, 24)."""
 
 import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,13 +40,36 @@ def fetch(url: str, max_size: int = MAX_FILE_SIZE, timeout: float = HTTP_TIMEOUT
     validate_url(url)
     opener = urllib.request.build_opener(_LimitedRedirects())
     request = urllib.request.Request(url, headers={"User-Agent": "pcutpd/0.1"})
+    deadline = time.monotonic() + timeout
     try:
-        with opener.open(request, timeout=timeout) as response:
+        with opener.open(request, timeout=max(0.0, deadline - time.monotonic())) as response:
             declared = response.headers.get("Content-Length")
             if declared and declared.isdigit() and int(declared) > max_size:
                 raise SizeError(f"Content-Length {declared} exceeds {max_size}")
-            data = response.read(max_size + 1)
+            chunks = []
+            total = 0
+            while total <= max_size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("HTTP fetch deadline exceeded")
+                # urllib's timeout is normally applied per socket operation.
+                # Tighten the underlying socket for each read so a slow stream
+                # cannot outlive the receiver's FETCH_TIMEOUT window.
+                try:
+                    response.fp.raw._sock.settimeout(remaining)
+                except AttributeError:
+                    pass
+                chunk = response.read(min(65536, max_size + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            data = b"".join(chunks)
+            if time.monotonic() > deadline:
+                raise TimeoutError("HTTP fetch deadline exceeded")
             final_url = response.geturl()
+    except TimeoutError as exc:
+        raise HttpError("HTTP fetch timed out", detail="timeout") from exc
     except urllib.error.HTTPError as exc:
         raise HttpError(f"HTTP {exc.code}", detail=str(exc.code)) from exc
     except urllib.error.URLError as exc:

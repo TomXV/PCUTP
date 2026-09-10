@@ -1,7 +1,9 @@
+import time
+
 import pytest
 
 from pcutp import crc, names
-from pcutp.errors import FileError, SizeError, UrlError
+from pcutp.errors import FileError, HttpError, SizeError, UrlError
 from pcutp.fetcher import validate_url
 from pcutp.link import Link
 from pcutp.transport import PipePair
@@ -72,3 +74,31 @@ def test_fetch_size_limit(monkeypatch):
     )
     with pytest.raises(SizeError):
         fetcher.fetch("https://example.com/big", max_size=1024)
+
+
+def test_fetch_enforces_one_deadline_for_a_slow_body(monkeypatch):
+    from pcutp import fetcher
+
+    class FakeResponse:
+        headers = {}
+
+        def read(self, n):
+            time.sleep(0.01)
+            return b"x"
+
+        def geturl(self):
+            return "https://example.com/slow"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        fetcher.urllib.request, "build_opener", lambda *a: type(
+            "O", (), {"open": lambda self, req, timeout=None: FakeResponse()}
+        )()
+    )
+    with pytest.raises(HttpError, match="timed out"):
+        fetcher.fetch("https://example.com/slow", max_size=1024, timeout=0.001)

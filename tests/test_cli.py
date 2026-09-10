@@ -62,3 +62,13 @@ def test_console_keeps_the_bar_below_log_lines(capsys):
     out = capsys.readouterr().out
     assert "RX< ACK 3" in out
     assert out.rstrip().endswith("50 / 100 bytes")
+
+
+def test_control_socket_does_not_unlink_a_regular_file(tmp_path):
+    path = tmp_path / "pcutpd.sock"
+    path.write_text("keep me", encoding="ascii")
+
+    with pytest.raises(FileExistsError):
+        daemon.ControlSocket(str(path))
+
+    assert path.read_text(encoding="ascii") == "keep me"

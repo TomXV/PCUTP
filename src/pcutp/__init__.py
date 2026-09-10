@@ -1,4 +1,4 @@
-"""PCUTP - PicoCalc / uConsole UART File Transfer Protocol (v0.1)."""
+"""PCUTP - PicoCalc / uConsole UART File Transfer Protocol (v2)."""
 
-__version__ = "0.1.0"
-PROTOCOL_VERSION = "PCUTP/1"
+__version__ = "2.1.0"
+PROTOCOL_VERSION = "PCUTP/2"

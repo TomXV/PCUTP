@@ -1,0 +1,28 @@
+[
+  {
+    "block": 4096,
+    "requested_block": 4096,
+    "window": 2,
+    "iteration": 0,
+    "size": 32768,
+    "seconds": 3.995696971003781,
+    "kib_s": 8.008615325991826,
+    "request_seconds": 3.9960834619996604,
+    "retransmits": 2,
+    "crc32": "751F3E92",
+    "verified": true,
+    "program": "B:/PCFAST.BAS",
+    "corrupt_seq": 1,
+    "drop_ack": -1,
+    "barriers": 1,
+    "negotiated_window": 2,
+    "compression": "off",
+    "compressed_blocks": 0,
+    "data_wire_bytes": 41170,
+    "fixture": "generated",
+    "sound": true,
+    "audio_events": 20,
+    "audio_max_render_delay_ms": 9.735490006278269,
+    "audio_underruns": 0
+  }
+]

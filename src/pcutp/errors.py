@@ -59,3 +59,7 @@ class RetryError(PcutpError):
 
 class ProtocolError(PcutpError):
     code = "PROTOCOL"
+
+
+class LinkLostError(PcutpError):
+    code = "LINKLOST"

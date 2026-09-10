@@ -1,0 +1,22 @@
+{
+  "pcutp-fixture.bas": {
+    "size": 27242,
+    "sha256": "ce9a211349a2c94d50104aa2c7e6c0425d12b1c3f0cc8073648b85a16b200c99"
+  },
+  "pcutp-fixture.gz": {
+    "size": 10045,
+    "sha256": "6a20262d94543099016402984559cf398fae3d9692e844024bd213150e68cfff"
+  },
+  "pcutp-random.bin": {
+    "size": 131072,
+    "sha256": "dc4b60b01d68ea6fd467f7f7dad22e50ae8b661f807257e2aa6275e2e976f81b"
+  },
+  "turrican.mod": {
+    "size": 41364,
+    "sha256": "2c1ce32e40cf326c107d88838ef3ce7aebe3391d0d061e17e19d2a7db55a7b10"
+  },
+  "touhou_unowen.mod": {
+    "size": 313786,
+    "sha256": "ba34474fc5174c3f48d09ebd446d4367b5a73740247169adff648c70327226dc"
+  }
+}
